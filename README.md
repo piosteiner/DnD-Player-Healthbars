@@ -4,6 +4,10 @@ Live HP overlay synced to D&D Beyond, with per-character portraits that
 change based on health state.
 
 ---
+DISCLAIMER
+Project based on Power Word Spill's https://github.com/powerwordspill/healthbar but adapted to implement the health bars in a digital environment.
+This project was vibecoded with Claude AI.
+---
 
 ## Downloading a release (no Python needed)
 
@@ -18,20 +22,6 @@ the file for your OS:
 Run it directly — no installation required.  
 On first launch it creates **`dnd_healthbar.json`** next to the binary.
 This is your config file and is never overwritten by updates.
-
----
-
-## Setting up the repository (one-time)
-
-1. [Create a new GitHub repository](https://github.com/new) (can be private).
-2. Upload these files to the root of the repo:
-   ```
-   dnd_healthbar.py
-   dnd_healthbar.spec
-   .github/workflows/build.yml
-   README.md
-   ```
-3. That's it. GitHub Actions is now configured.
 
 ---
 
