@@ -1,0 +1,109 @@
+name: Build & Release
+
+# Triggers when you push a tag like v1.0.0, v1.2.3, etc.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    name: Windows (.exe)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pyinstaller requests websocket-client Pillow
+
+      - name: Build executable
+        run: pyinstaller dnd_healthbar.spec --clean --noconfirm
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/DnD_HealthBar.exe
+
+  build-linux:
+    name: Linux (binary)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system dependencies
+        run: sudo apt-get install -y python3-tk
+
+      - name: Install Python dependencies
+        run: pip install pyinstaller requests websocket-client Pillow
+
+      - name: Build executable
+        run: pyinstaller dnd_healthbar.spec --clean --noconfirm
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binary
+          path: dist/DnD_HealthBar
+
+  release:
+    name: Create GitHub Release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: release/
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-binary
+          path: release/
+
+      - name: Make Linux binary executable
+        run: chmod +x release/DnD_HealthBar
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create release with both binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          name: D&D Health Bar ${{ steps.version.outputs.VERSION }}
+          body: |
+            ## D&D Health Bar ${{ steps.version.outputs.VERSION }}
+
+            Download the right file for your OS below:
+
+            | OS      | File                   |
+            |---------|------------------------|
+            | Windows | `DnD_HealthBar.exe`    |
+            | Linux   | `DnD_HealthBar`        |
+
+            **First time?** Just download and run — no Python needed.
+
+            **Updating?** Replace your old binary with the new one.
+            Your `dnd_healthbar.json` config is never affected.
+          files: |
+            release/DnD_HealthBar.exe
+            release/DnD_HealthBar
+          draft: false
+          prerelease: false

@@ -1,0 +1,20 @@
+# User config — contains personal IDs and cookie, never commit this
+dnd_healthbar.json
+
+# PyInstaller build output
+dist/
+build/
+*.spec.bak
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Backup files created by update script
+*.bak
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
