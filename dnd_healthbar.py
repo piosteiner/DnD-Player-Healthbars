@@ -24,9 +24,9 @@ Requirements:
     pip install requests websocket-client Pillow
 """
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
-import os, json, time, threading, traceback
+import os, sys, json, time, threading, traceback
 import tkinter as tk
 from tkinter import filedialog, simpledialog, messagebox
 from PIL import Image, ImageTk, ImageDraw
@@ -70,7 +70,14 @@ WINDOW_H      = PORTRAIT_SIZE + BAR_H + BAR_PAD * 3 + 60
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dnd_healthbar.json")
+# When bundled by PyInstaller sys.executable points to the actual .exe;
+# __file__ would point into the temp extraction folder instead.
+if getattr(sys, "frozen", False):
+    _BASE_DIR = os.path.dirname(sys.executable)
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_FILE = os.path.join(_BASE_DIR, "dnd_healthbar.json")
 
 def load_config() -> dict:
     if os.path.isfile(CONFIG_FILE):
