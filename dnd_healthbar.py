@@ -157,28 +157,42 @@ def save_config(cfg: dict):
 # ---------------------------------------------------------------------------
 def get_token(cookie: str = "") -> tuple[str, int]:
     """Fetch a cobalt token. Pass empty cookie for public/anonymous characters."""
-    headers = {"Accept": "*/*", "Origin": ORIGIN, "Referer": REFERER,
-               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    session = requests.Session()
+    headers = {
+        "Accept": "*/*",
+        "Origin": ORIGIN,
+        "Referer": REFERER,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150.0.0.0 Safari/537.36",
+    }
     if cookie:
         headers["Cookie"] = cookie
-    resp = requests.get(AUTH_URL, headers=headers, timeout=15)
+    else:
+        # For public characters we need to first visit D&D Beyond so the
+        # server sets its AWS load balancer cookies (AWSALBTG etc.) which
+        # the character API requires even for anonymous requests.
+        try:
+            session.get(ORIGIN, headers=headers, timeout=10)
+        except Exception:
+            pass  # proceed anyway, token fetch may still work
+
+    resp = session.get(AUTH_URL, headers=headers, timeout=15)
     resp.raise_for_status()
     data = resp.json()
-    return data["token"], int(data.get("ttl", 300))
+    return data["token"], int(data.get("ttl", 300)), session
 
 
-def get_character(cookie: str, token: str, character_id: str) -> dict:
+def get_character(session: requests.Session, cookie: str, token: str, character_id: str) -> dict:
     headers = {
         "Accept": "application/json",
         "Origin": ORIGIN, "Referer": REFERER,
         "Authorization": "Bearer " + token,
         "Connection": "close",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150.0.0.0 Safari/537.36",
     }
     if cookie:
         headers["Cookie"] = cookie
-    resp = requests.get(CHARACTER_URL + character_id + "?includeCustomItems=true",
-                        headers=headers, timeout=30)
+    resp = session.get(CHARACTER_URL + character_id + "?includeCustomItems=true",
+                       headers=headers, timeout=30)
     resp.raise_for_status()
     char = resp.json().get("data", {})
 
@@ -469,21 +483,22 @@ class CharacterWindow:
         user_id   = self.char.get("user_id", "")
         char_id   = self.char["character_id"]
         token, ttl, start, refresh_at = None, 300, None, 270
+        session   = None
 
         while not self._stop.is_set():
             try:
                 if start is None or (time.monotonic() - start) > refresh_at:
                     self._set_status("auth")
-                    token, ttl = get_token(cookie)
+                    token, ttl, session = get_token(cookie)
                     refresh_at = max(30, ttl - 30)
                     start = time.monotonic()
 
                 self._set_status("fetch")
-                cdata = get_character(cookie, token, char_id)
+                cdata = get_character(session, cookie, token, char_id)
                 pct, cur, mx = calculate_hp(cdata)
                 self._update_ui(pct, cur, mx)
                 self._set_status("listen")
-                self._listen_ws(cookie, user_id, char_id, token, start, refresh_at)
+                self._listen_ws(session, cookie, user_id, char_id, token, start, refresh_at)
 
             except Exception as e:
                 print(f"[{char_id}] error: {e}")
@@ -491,6 +506,7 @@ class CharacterWindow:
                 self._set_status("error")
                 time.sleep(5)
                 start = None
+                session = None
 
     def _set_status(self, key: str):
         msgs = {"auth":"Authenticating…","fetch":"Fetching character…",
@@ -499,8 +515,8 @@ class CharacterWindow:
         if self._status_cb:
             self._status_cb(self.char["character_id"], msgs.get(key, key))
 
-    def _listen_ws(self, cookie, user_id, char_id, token, start, refresh_at):
-        # Public characters with no user_id: fall back to polling every 30s
+    def _listen_ws(self, session, cookie, user_id, char_id, token, start, refresh_at):
+        # Public characters with no user_id: fall back to polling every 5s
         if not user_id:
             self._set_status("poll")
             while not self._stop.is_set():
@@ -509,7 +525,7 @@ class CharacterWindow:
                 time.sleep(5)
                 if self._stop.is_set(): break
                 try:
-                    cdata = get_character(cookie, token, char_id)
+                    cdata = get_character(session, cookie, token, char_id)
                     pct, cur, mx = calculate_hp(cdata)
                     self._update_ui(pct, cur, mx)
                 except Exception as e:
@@ -539,7 +555,7 @@ class CharacterWindow:
                 except: continue
                 if should_refresh(evt, char_id):
                     ws.close(); self._ws = None
-                    cdata = get_character(cookie, token, char_id)
+                    cdata = get_character(session, cookie, token, char_id)
                     pct, cur, mx = calculate_hp(cdata)
                     self._update_ui(pct, cur, mx)
                     ws = websocket.create_connection(ws_url, timeout=30,
