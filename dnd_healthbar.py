@@ -31,7 +31,7 @@ Requirements:
     pip install requests websocket-client Pillow
 """
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.0.1"
 
 import os, sys, json, time, threading, traceback
 import tkinter as tk
@@ -40,7 +40,7 @@ from PIL import Image, ImageTk, ImageDraw
 import requests, websocket
 
 # ---------------------------------------------------------------------------
-# D&D Beyond API
+# API
 # ---------------------------------------------------------------------------
 AUTH_URL      = "https://auth-service.dndbeyond.com/v1/cobalt-token"
 WS_BASE       = "wss://game-log-api-live.dndbeyond.com/v1"
@@ -49,7 +49,7 @@ ORIGIN        = "https://www.dndbeyond.com"
 REFERER       = "https://www.dndbeyond.com"
 
 # ---------------------------------------------------------------------------
-# UI
+# Palette  (mockup v3)
 # ---------------------------------------------------------------------------
 # Manager chrome
 MGR_BG        = "#16202a"   # window body
@@ -129,8 +129,6 @@ HP_H_NUMS     = HP_H + 26                  # extra height when numbers are shown
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-# When bundled by PyInstaller sys.executable points to the actual .exe;
-# __file__ would point into the temp extraction folder instead.
 if getattr(sys, "frozen", False):
     _BASE_DIR = os.path.dirname(sys.executable)
 else:
@@ -155,10 +153,14 @@ def save_config(cfg: dict):
         print(f"Warning: could not save config: {e}")
 
 # ---------------------------------------------------------------------------
-# D&D Beyond API helpers
+# API helpers
 # ---------------------------------------------------------------------------
-def get_token(cookie: str) -> tuple[str, int]:
-    headers = {"Accept": "*/*", "Origin": ORIGIN, "Referer": REFERER, "Cookie": cookie}
+def get_token(cookie: str = "") -> tuple[str, int]:
+    """Fetch a cobalt token. Pass empty cookie for public/anonymous characters."""
+    headers = {"Accept": "*/*", "Origin": ORIGIN, "Referer": REFERER,
+               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    if cookie:
+        headers["Cookie"] = cookie
     resp = requests.get(AUTH_URL, headers=headers, timeout=15)
     resp.raise_for_status()
     data = resp.json()
@@ -169,10 +171,12 @@ def get_character(cookie: str, token: str, character_id: str) -> dict:
     headers = {
         "Accept": "application/json",
         "Origin": ORIGIN, "Referer": REFERER,
-        "Cookie": cookie,
         "Authorization": "Bearer " + token,
         "Connection": "close",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
+    if cookie:
+        headers["Cookie"] = cookie
     resp = requests.get(CHARACTER_URL + character_id + "?includeCustomItems=true",
                         headers=headers, timeout=30)
     resp.raise_for_status()
@@ -324,7 +328,7 @@ class ToggleSwitch(tk.Canvas):
         if self._cmd: self._cmd()
 
 # ---------------------------------------------------------------------------
-# Character HP overlay window
+# HP overlay window
 # ---------------------------------------------------------------------------
 class CharacterWindow:
     def __init__(self, master, game_id: str, char: dict,
@@ -460,9 +464,10 @@ class CharacterWindow:
 
     # ── Worker ───────────────────────────────────────────────────────────────
     def _run_loop(self):
-        cookie  = self.char["cookie_header"]
-        user_id = self.char["user_id"]
-        char_id = self.char["character_id"]
+        is_public = bool(self.char.get("is_public", False))
+        cookie    = "" if is_public else self.char.get("cookie_header", "")
+        user_id   = self.char.get("user_id", "")
+        char_id   = self.char["character_id"]
         token, ttl, start, refresh_at = None, 300, None, 270
 
         while not self._stop.is_set():
@@ -489,20 +494,34 @@ class CharacterWindow:
 
     def _set_status(self, key: str):
         msgs = {"auth":"Authenticating…","fetch":"Fetching character…",
-                "listen":"Listening…","error":"Error — retrying…"}
-        if self.on_hp_update:
-            # pass status as special call with pct=-1 to signal status-only update
-            cid = self.char["character_id"]
-            # We use a dedicated callback instead
-            pass
+                "listen":"Listening…","poll":"Polling every 5s…",
+                "error":"Error — retrying…"}
         if self._status_cb:
             self._status_cb(self.char["character_id"], msgs.get(key, key))
 
     def _listen_ws(self, cookie, user_id, char_id, token, start, refresh_at):
+        # Public characters with no user_id: fall back to polling every 30s
+        if not user_id:
+            self._set_status("poll")
+            while not self._stop.is_set():
+                if (time.monotonic() - start) > refresh_at:
+                    break
+                time.sleep(5)
+                if self._stop.is_set(): break
+                try:
+                    cdata = get_character(cookie, token, char_id)
+                    pct, cur, mx = calculate_hp(cdata)
+                    self._update_ui(pct, cur, mx)
+                except Exception as e:
+                    print(f"[{char_id}] poll err: {e}")
+            return
+
         ws_url = (WS_BASE + "?gameId=" + self.game_id
                   + "&userId=" + user_id + "&stt=" + token)
-        ws = websocket.create_connection(ws_url, timeout=30,
-             header={"Origin": ORIGIN, "Cookie": cookie})
+        ws_headers = {"Origin": ORIGIN}
+        if cookie:
+            ws_headers["Cookie"] = cookie
+        ws = websocket.create_connection(ws_url, timeout=30, header=ws_headers)
         self._ws = ws
         try:
             while not self._stop.is_set():
@@ -524,7 +543,7 @@ class CharacterWindow:
                     pct, cur, mx = calculate_hp(cdata)
                     self._update_ui(pct, cur, mx)
                     ws = websocket.create_connection(ws_url, timeout=30,
-                         header={"Origin": ORIGIN, "Cookie": cookie})
+                         header=ws_headers)
                     self._ws = ws
         finally:
             try: ws.close()
@@ -578,26 +597,51 @@ class CharacterDialog(tk.Toplevel):
         body = tk.Frame(self, bg=DLG_BG)
         body.pack(fill="x", padx=14, pady=10)
 
-        # ── Credentials ──
-        cred_fields = [
-            ("name",         "CHARACTER NAME", ch.get("name",         ""), False),
-            ("user_id",      "USER ID",        ch.get("user_id",      ""), False),
-            ("character_id", "CHARACTER ID",   ch.get("character_id", ""), False),
-        ]
         self._vars = {}
-        for key, label, val, _ in cred_fields:
-            self._add_field(body, key, label, val, show="")
 
-        # cookie with eye toggle
-        tk.Label(body, text="COOKIE HEADER", bg=DLG_BG, fg=DLG_LABEL_FG,
+        # ── Public toggle ──
+        pub_row = tk.Frame(body, bg=DLG_BG)
+        pub_row.pack(fill="x", pady=(0,6))
+        tk.Label(pub_row, text="Public character", bg=DLG_BG, fg=T_PRIMARY,
+                 font=F_MED).pack(side="left")
+        tk.Label(pub_row, text="  (no cookie needed)", bg=DLG_BG, fg=T_DIM,
+                 font=F_TINY).pack(side="left")
+        self._is_public_var = tk.BooleanVar(value=bool(ch.get("is_public", False)))
+        ToggleSwitch(pub_row, self._is_public_var,
+                     command=self._on_public_toggle, bg=DLG_BG).pack(side="right")
+        mk_sep(body, MGR_BORDER, 0)
+
+        # ── Always-shown fields ──
+        self._add_field(body, "name",         "CHARACTER NAME", ch.get("name",""),         show="")
+        self._add_field(body, "character_id", "CHARACTER ID",   ch.get("character_id",""), show="")
+
+        # ── Private-only credentials ──
+        self._private_frame = tk.Frame(body, bg=DLG_BG)
+        self._add_field(self._private_frame, "user_id", "USER ID", ch.get("user_id",""), show="")
+        tk.Label(self._private_frame, text="COOKIE HEADER", bg=DLG_BG, fg=DLG_LABEL_FG,
                  font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(6,2))
-        cf = tk.Frame(body, bg=DLG_BG)
+        cf = tk.Frame(self._private_frame, bg=DLG_BG)
         cf.pack(fill="x", pady=(0,4))
         self._vars["cookie_header"] = tk.StringVar(value=ch.get("cookie_header",""))
         self._cookie_entry = styled_entry(cf, self._vars["cookie_header"], width=36, show="*")
         self._cookie_entry.pack(side="left", ipady=4, padx=(0,4))
         styled_button(cf, "👁", BTN_EDIT_BG, BTN_EDIT_FG, BTN_EDIT_BD,
                       self._toggle_cookie, font=F_SMALL).pack(side="left")
+        tk.Label(self._private_frame,
+                 text="⚠  Cookie may change over time — re-enter if connection fails.",
+                 bg=DLG_BG, fg=T_MUTED, font=F_TINY,
+                 wraplength=380, justify="left").pack(anchor="w", pady=(4,0))
+
+        # ── Public-only notice + optional user_id for live WS ──
+        self._public_frame = tk.Frame(body, bg=DLG_BG)
+        tk.Label(self._public_frame,
+                 text="ℹ  Public characters authenticate anonymously. "
+                      "HP updates every 30 s. Add your User ID for live updates via WebSocket.",
+                 bg=DLG_BG, fg=T_DIM, font=F_TINY,
+                 wraplength=380, justify="left").pack(anchor="w", pady=(4,4))
+        self._add_field(self._public_frame, "user_id",
+                        "USER ID  (optional — enables live updates)",
+                        ch.get("user_id",""), show="")
 
         # ── Portrait section ──
         mk_sep(body, MGR_BORDER, 0)
@@ -645,12 +689,6 @@ class CharacterDialog(tk.Toplevel):
         self._on_top_var = tk.BooleanVar(value=bool(ch.get("always_on_top", False)))
         ToggleSwitch(opt_row, self._on_top_var, bg=DLG_BG).pack(side="right")
 
-        # ── Warning ──
-        tk.Label(body,
-                 text="⚠  Cookie may change over time — re-enter if connection fails.",
-                 bg=DLG_BG, fg=T_MUTED, font=F_TINY,
-                 wraplength=380, justify="left").pack(anchor="w", pady=(8,2))
-
         # ── Footer ──
         mk_sep(self, MGR_BORDER)
         foot = tk.Frame(self, bg=MGR_HEADER)
@@ -659,6 +697,19 @@ class CharacterDialog(tk.Toplevel):
                       self.destroy).pack(side="right", padx=(4,0), ipady=4, ipadx=8)
         styled_button(foot, "Save",  BTN_SAVE_BG, BTN_SAVE_FG, BTN_SAVE_BD,
                       self._submit, font=F_MED).pack(side="right", ipady=4, ipadx=12)
+
+        # Apply initial state
+        self._on_public_toggle()
+
+    def _on_public_toggle(self):
+        if self._is_public_var.get():
+            self._private_frame.pack_forget()
+            self._public_frame.pack(fill="x")
+        else:
+            self._public_frame.pack_forget()
+            self._private_frame.pack(fill="x")
+        self.update_idletasks()
+        self.geometry("")
 
     def _add_field(self, parent, key, label, val, show=""):
         tk.Label(parent, text=label, bg=DLG_BG, fg=DLG_LABEL_FG,
@@ -679,14 +730,27 @@ class CharacterDialog(tk.Toplevel):
 
     def _submit(self):
         vals = {k: v.get().strip() for k, v in self._vars.items()}
-        if not all([vals["name"], vals["user_id"],
-                    vals["character_id"], vals["cookie_header"]]):
+        is_public = self._is_public_var.get()
+
+        # Validation
+        required = ["name", "character_id"]
+        if not is_public:
+            required += ["user_id", "cookie_header"]
+        missing = [k for k in required if not vals.get(k)]
+        if missing:
             messagebox.showwarning("Required",
-                "Name, User ID, Character ID and Cookie are required.", parent=self)
+                "Name and Character ID are required.\n"
+                + ("User ID and Cookie are also required for private characters."
+                   if not is_public else ""),
+                parent=self)
             return
+
         for key, var in self._portrait_vars.items():
             vals[key] = var.get().strip()
-        vals["always_on_top"]  = self._on_top_var.get()
+        vals["always_on_top"] = self._on_top_var.get()
+        vals["is_public"]     = is_public
+        if is_public:
+            vals["cookie_header"] = ""   # clear cookie for public chars
         self.result = vals
         self.destroy()
 
@@ -940,7 +1004,8 @@ class ManagerWindow:
         info.pack(side="left", fill="x", expand=True)
         tk.Label(info, text=ch.get("name","Unknown"), bg=MGR_ROW, fg=T_PRIMARY,
                  font=F_BOLD, anchor="w").pack(anchor="w")
-        tk.Label(info, text=cid, bg=MGR_ROW, fg=T_DIM,
+        sub = "🌐 Public" if ch.get("is_public") else cid
+        tk.Label(info, text=sub, bg=MGR_ROW, fg=T_DIM,
                  font=F_TINY, anchor="w").pack(anchor="w")
 
         # HP badge
