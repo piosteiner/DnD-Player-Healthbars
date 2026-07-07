@@ -155,40 +155,54 @@ def save_config(cfg: dict):
 # ---------------------------------------------------------------------------
 # API helpers
 # ---------------------------------------------------------------------------
-def get_token(cookie: str = "") -> tuple[str, int]:
-    """Fetch a cobalt token. Pass empty cookie for public/anonymous characters."""
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+
+def make_public_session(character_id: str) -> requests.Session:
+    """For public characters: visit the character page to collect the Geo
+    cookie, which is all the character API needs — no login required."""
     session = requests.Session()
+    session.get(f"{ORIGIN}/characters/{character_id}",
+                headers={"User-Agent": UA}, timeout=10)
+    return session
+
+
+def get_token(cookie: str, character_id: str = "") -> tuple[str, int, requests.Session]:
+    """Fetch a cobalt token for private characters. Requires a session cookie."""
+    session = requests.Session()
+    referer = f"{ORIGIN}/characters/{character_id}" if character_id else REFERER
     headers = {
         "Accept": "*/*",
         "Origin": ORIGIN,
-        "Referer": REFERER,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150.0.0.0 Safari/537.36",
+        "Referer": referer,
+        "User-Agent": UA,
+        "Cookie": cookie,
     }
-    if cookie:
-        headers["Cookie"] = cookie
-    else:
-        # For public characters we need to first visit D&D Beyond so the
-        # server sets its AWS load balancer cookies (AWSALBTG etc.) which
-        # the character API requires even for anonymous requests.
-        try:
-            session.get(ORIGIN, headers=headers, timeout=10)
-        except Exception:
-            pass  # proceed anyway, token fetch may still work
-
     resp = session.get(AUTH_URL, headers=headers, timeout=15)
     resp.raise_for_status()
     data = resp.json()
-    return data["token"], int(data.get("ttl", 300)), session
+    token = data.get("token")
+    if not token:
+        raise ValueError("Invalid or expired cookie — no token returned.")
+    return token, int(data.get("ttl", 300)), session
 
 
-def get_character(session: requests.Session, cookie: str, token: str, character_id: str) -> dict:
+def get_character(session: requests.Session, cookie: str, token: str,
+                  character_id: str) -> dict:
+    """Fetch character data. For public characters pass token=None and cookie=""."""
     headers = {
-        "Accept": "application/json",
-        "Origin": ORIGIN, "Referer": REFERER,
-        "Authorization": "Bearer " + token,
-        "Connection": "close",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "en-GB,en;q=0.6",
+        "Origin": ORIGIN,
+        "Referer": f"{ORIGIN}/",
+        "User-Agent": UA,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+        "Priority": "u=1, i",
     }
+    if token:
+        headers["Authorization"] = "Bearer " + token
     if cookie:
         headers["Cookie"] = cookie
     resp = session.get(CHARACTER_URL + character_id + "?includeCustomItems=true",
@@ -482,31 +496,63 @@ class CharacterWindow:
         cookie    = "" if is_public else self.char.get("cookie_header", "")
         user_id   = self.char.get("user_id", "")
         char_id   = self.char["character_id"]
-        token, ttl, start, refresh_at = None, 300, None, 270
+        token     = None
+        ttl       = 300
+        start     = None
+        refresh_at= 270
         session   = None
 
         while not self._stop.is_set():
             try:
-                if start is None or (time.monotonic() - start) > refresh_at:
-                    self._set_status("auth")
-                    token, ttl, session = get_token(cookie)
-                    refresh_at = max(30, ttl - 30)
-                    start = time.monotonic()
-
-                self._set_status("fetch")
-                cdata = get_character(session, cookie, token, char_id)
-                pct, cur, mx = calculate_hp(cdata)
-                self._update_ui(pct, cur, mx)
-                self._set_status("listen")
-                self._listen_ws(session, cookie, user_id, char_id, token, start, refresh_at)
+                if is_public:
+                    # Public characters: just visit the page to get Geo cookie,
+                    # then hit the character API directly — no auth token needed.
+                    if session is None:
+                        self._set_status("auth")
+                        session = make_public_session(char_id)
+                    self._set_status("fetch")
+                    cdata = get_character(session, "", None, char_id)
+                    pct, cur, mx = calculate_hp(cdata)
+                    self._update_ui(pct, cur, mx)
+                    self._set_status("poll")
+                    self._poll(session, char_id)
+                    session = None  # refresh session on next loop
+                else:
+                    # Private characters: full cobalt-token auth flow.
+                    if token is None or start is None or (time.monotonic() - start) > refresh_at:
+                        self._set_status("auth")
+                        token, ttl, session = get_token(cookie, char_id)
+                        refresh_at = max(30, ttl - 30)
+                        start = time.monotonic()
+                    self._set_status("fetch")
+                    cdata = get_character(session, cookie, token, char_id)
+                    pct, cur, mx = calculate_hp(cdata)
+                    self._update_ui(pct, cur, mx)
+                    self._set_status("listen")
+                    self._listen_ws(session, cookie, user_id, char_id,
+                                    token, start, refresh_at)
 
             except Exception as e:
                 print(f"[{char_id}] error: {e}")
                 traceback.print_exc()
                 self._set_status("error")
-                time.sleep(5)
-                start = None
+                token   = None
                 session = None
+                start   = None
+                time.sleep(5)
+
+    def _poll(self, session, char_id: str):
+        """Polling loop for public characters — no WebSocket needed."""
+        while not self._stop.is_set():
+            time.sleep(5)
+            if self._stop.is_set(): break
+            try:
+                cdata = get_character(session, "", None, char_id)
+                pct, cur, mx = calculate_hp(cdata)
+                self._update_ui(pct, cur, mx)
+            except Exception as e:
+                print(f"[{char_id}] poll err: {e}")
+                break  # break to outer loop to refresh session
 
     def _set_status(self, key: str):
         msgs = {"auth":"Authenticating…","fetch":"Fetching character…",
@@ -620,8 +666,8 @@ class CharacterDialog(tk.Toplevel):
         pub_row.pack(fill="x", pady=(0,6))
         tk.Label(pub_row, text="Public character", bg=DLG_BG, fg=T_PRIMARY,
                  font=F_MED).pack(side="left")
-        tk.Label(pub_row, text="  (no cookie needed)", bg=DLG_BG, fg=T_DIM,
-                 font=F_TINY).pack(side="left")
+        tk.Label(pub_row, text="  (no cookie needed if character sheet is public)",
+                 bg=DLG_BG, fg=T_DIM, font=F_TINY).pack(side="left")
         self._is_public_var = tk.BooleanVar(value=bool(ch.get("is_public", False)))
         ToggleSwitch(pub_row, self._is_public_var,
                      command=self._on_public_toggle, bg=DLG_BG).pack(side="right")
@@ -648,16 +694,13 @@ class CharacterDialog(tk.Toplevel):
                  bg=DLG_BG, fg=T_MUTED, font=F_TINY,
                  wraplength=380, justify="left").pack(anchor="w", pady=(4,0))
 
-        # ── Public-only notice + optional user_id for live WS ──
+        # ── Public-only notice ──
         self._public_frame = tk.Frame(body, bg=DLG_BG)
         tk.Label(self._public_frame,
-                 text="ℹ  Public characters authenticate anonymously. "
-                      "HP updates every 30 s. Add your User ID for live updates via WebSocket.",
+                 text="ℹ  Public characters are fetched anonymously — no cookie or login needed. "
+                      "HP is polled every 5 seconds.",
                  bg=DLG_BG, fg=T_DIM, font=F_TINY,
-                 wraplength=380, justify="left").pack(anchor="w", pady=(4,4))
-        self._add_field(self._public_frame, "user_id",
-                        "USER ID  (optional — enables live updates)",
-                        ch.get("user_id",""), show="")
+                 wraplength=380, justify="left").pack(anchor="w", pady=(6,0))
 
         # ── Portrait section ──
         mk_sep(body, MGR_BORDER, 0)
@@ -747,26 +790,22 @@ class CharacterDialog(tk.Toplevel):
     def _submit(self):
         vals = {k: v.get().strip() for k, v in self._vars.items()}
         is_public = self._is_public_var.get()
-
-        # Validation
-        required = ["name", "character_id"]
+        required  = ["name", "character_id"]
         if not is_public:
             required += ["user_id", "cookie_header"]
-        missing = [k for k in required if not vals.get(k)]
-        if missing:
+        if not all(vals.get(k) for k in required):
             messagebox.showwarning("Required",
-                "Name and Character ID are required.\n"
-                + ("User ID and Cookie are also required for private characters."
-                   if not is_public else ""),
+                "Name and Character ID are always required.\n"
+                "User ID and Cookie are also required for private characters.",
                 parent=self)
             return
-
         for key, var in self._portrait_vars.items():
             vals[key] = var.get().strip()
         vals["always_on_top"] = self._on_top_var.get()
         vals["is_public"]     = is_public
         if is_public:
-            vals["cookie_header"] = ""   # clear cookie for public chars
+            vals.setdefault("user_id", "")
+            vals.setdefault("cookie_header", "")
         self.result = vals
         self.destroy()
 

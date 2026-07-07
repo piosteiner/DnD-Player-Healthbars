@@ -1,4 +1,5 @@
-# User config — contains personal IDs and cookie, never commit this
+# User config — contains no credentials but keep out of version control
+dnd_healthbar_public.json
 dnd_healthbar.json
 
 # PyInstaller build output
@@ -10,7 +11,7 @@ build/
 __pycache__/
 *.py[cod]
 
-# Backup files created by update script
+# Backup files
 *.bak
 
 # macOS

@@ -1,6 +1,5 @@
 name: Build & Release
 
-# Triggers when you push a tag like v1.0.0, v1.2.3, etc.
 on:
   push:
     tags:
@@ -20,16 +19,16 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install pyinstaller requests websocket-client Pillow
+        run: pip install pyinstaller requests Pillow pystray
 
-      - name: Build executable
-        run: pyinstaller dnd_healthbar.spec --clean --noconfirm
+      - name: Build public edition
+        run: pyinstaller dnd_healthbar_public.spec --clean --noconfirm
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-exe
-          path: dist/DnD_HealthBar.exe
+          path: dist/DnD_HealthBar_Public.exe
 
   build-linux:
     name: Linux (binary)
@@ -44,19 +43,21 @@ jobs:
           python-version: '3.12'
 
       - name: Install system dependencies
-        run: sudo apt-get install -y python3-tk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk libappindicator3-dev gir1.2-appindicator3-0.1
 
       - name: Install Python dependencies
-        run: pip install pyinstaller requests websocket-client Pillow
+        run: pip install pyinstaller requests Pillow pystray
 
-      - name: Build executable
-        run: pyinstaller dnd_healthbar.spec --clean --noconfirm
+      - name: Build public edition
+        run: pyinstaller dnd_healthbar_public.spec --clean --noconfirm
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-binary
-          path: dist/DnD_HealthBar
+          path: dist/DnD_HealthBar_Public
 
   release:
     name: Create GitHub Release
@@ -78,32 +79,30 @@ jobs:
           path: release/
 
       - name: Make Linux binary executable
-        run: chmod +x release/DnD_HealthBar
+        run: chmod +x release/DnD_HealthBar_Public
 
       - name: Extract version from tag
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-      - name: Create release with both binaries
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           name: D&D Health Bar ${{ steps.version.outputs.VERSION }}
           body: |
-            ## D&D Health Bar ${{ steps.version.outputs.VERSION }}
+            ## D&D Health Bar ${{ steps.version.outputs.VERSION }} — Public Edition
 
-            Download the right file for your OS below:
+            No login required. Works with public D&D Beyond character sheets only.
 
-            | OS      | File                   |
-            |---------|------------------------|
-            | Windows | `DnD_HealthBar.exe`    |
-            | Linux   | `DnD_HealthBar`        |
+            | OS      | File                          |
+            |---------|-------------------------------|
+            | Windows | `DnD_HealthBar_Public.exe`    |
+            | Linux   | `DnD_HealthBar_Public`        |
 
             **First time?** Just download and run — no Python needed.
-
-            **Updating?** Replace your old binary with the new one.
-            Your `dnd_healthbar.json` config is never affected.
+            **Updating?** Replace your old binary. Your config file is never affected.
           files: |
-            release/DnD_HealthBar.exe
-            release/DnD_HealthBar
+            release/DnD_HealthBar_Public.exe
+            release/DnD_HealthBar_Public
           draft: false
           prerelease: false
