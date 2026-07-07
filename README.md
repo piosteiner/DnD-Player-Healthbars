@@ -4,6 +4,11 @@ Live HP overlay synced to D&D Beyond, with per-character portraits that
 change based on health state.
 
 ---
+DISCLAIMER
+This project is uses the code from Power Word Spill's https://github.com/powerwordspill/healthbar but adapted to implement the health bars in a digital environment. With v.2.0.0 this project also abandoned the the idea of relying on session cookies to access private character data, and instead only works with public character sheets. The original project is no longer maintained, and this fork is intended to be a more secure and privacy-conscious alternative. Having a public character sheet is the only requirement to use this project, and it is recommended to set your character sheet to public on D&D Beyond for security reasons. If you use the old version which uses session cookies, you are at risk of exposing your D&D Beyond account to anyone who can read the cookie file.
+
+This project was created with the help of Anthropic's Claude AI.
+---
 
 ## ⚠ Public Edition only — full edition discontinued
 
@@ -47,40 +52,6 @@ Run it directly — no installation, no Python required.
 On first launch it creates **`dnd_healthbar_public.json`** next to the
 binary. This is your config file and contains no sensitive data.
 
----
-
-## Setting up the repository (one-time)
-
-1. [Create a new GitHub repository](https://github.com/new) (can be private).
-2. Upload these files to the root of the repo:
-   ```
-   dnd_healthbar_public.py
-   dnd_healthbar_public.spec
-   .gitignore
-   .github/workflows/build.yml
-   README.md
-   ```
-3. That's it. GitHub Actions is now configured.
-
-> **Why `.gitignore`?** It tells Git to never track the config JSON files.
-> Even though the public edition config contains no credentials, it's good
-> practice to keep personal config out of version control.
-
----
-
-## Publishing a new release
-
-1. Update `APP_VERSION = "x.y.z"` in `dnd_healthbar_public.py`.
-2. Commit and push to GitHub.
-3. Create and push a version tag:
-   ```
-   git tag v1.0.0
-   git push origin v1.0.0
-   ```
-4. GitHub Actions builds the Windows and Linux binaries automatically
-   (~4 minutes) and posts them on the Releases page.
-
----
 
 ## Config file (`dnd_healthbar_public.json`)
 
