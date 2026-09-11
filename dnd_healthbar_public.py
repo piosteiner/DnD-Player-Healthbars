@@ -65,8 +65,8 @@ MGR_BORDER3   = "#344858"
 MGR_PILL      = "#1e2c38"
 T_PRIMARY     = "#dce8f0"
 T_SECONDARY   = "#8ab0c0"
-T_DIM         = "#5a7888"
-T_MUTED       = "#3a5060"
+T_DIM         = "#82a0b0"   # brightened for readability
+T_MUTED       = "#6f8a9a"   # brightened for readability
 HP_FULL       = "#00e676"
 HP_SCRATCH    = "#40e880"
 HP_INJURED    = "#ffb300"
@@ -89,7 +89,7 @@ BTN_CANCEL_BG = "#1e2c38";  BTN_CANCEL_FG= "#7aaabb";  BTN_CANCEL_BD= "#344858"
 DANGER_BG     = "#3a1010";  DANGER_FG    = "#e05050";  DANGER_BD    = "#5a2020"
 DLG_BG        = "#16202a"
 DLG_ENTRY_BG  = "#1e2c38"
-DLG_LABEL_FG  = "#6a8898"
+DLG_LABEL_FG  = "#7ea6b6"
 F_TITLE  = ("Segoe UI", 14, "bold")
 F_BOLD   = ("Segoe UI", 11, "bold")
 F_MED    = ("Segoe UI", 10, "bold")
@@ -1110,9 +1110,9 @@ class ManagerWindow:
         is_open = cid in self._windows
         row = tk.Frame(self._char_frame, bg=MGR_ROW, highlightthickness=1,
                        highlightbackground="#2a4a5a" if is_open else MGR_BORDER2)
-        row.pack(fill="x", pady=3)
+        row.pack(fill="x", pady=5)
         inner = tk.Frame(row, bg=MGR_ROW)
-        inner.pack(fill="x", padx=8, pady=6)
+        inner.pack(fill="x", padx=10, pady=8)
 
         # Arrow buttons for manual sort (only active in manual mode)
         if self._sort_mode == "manual":
@@ -1245,7 +1245,7 @@ class ManagerWindow:
         try:
             img = fit_image(Image.open(path), size, MGR_ROW) \
                   if path else Image.new("RGBA",(size,size),MGR_ROW)
-            img=round_image(img,5)
+            img=round_image(img,8)
             photo=ImageTk.PhotoImage(img)
             canvas._photo=photo
             canvas.create_image(size//2,size//2,image=photo,anchor="center")

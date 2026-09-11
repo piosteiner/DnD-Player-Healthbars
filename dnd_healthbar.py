@@ -64,8 +64,8 @@ MGR_PILL      = "#1e2c38"   # game pill bg
 # Manager text
 T_PRIMARY     = "#dce8f0"   # names, titles
 T_SECONDARY   = "#8ab0c0"   # icon buttons, secondary labels
-T_DIM         = "#5a7888"   # subtext / char IDs
-T_MUTED       = "#3a5060"   # very muted hints
+T_DIM         = "#82a0b0"   # subtext / char IDs — brightened for readability
+T_MUTED       = "#6f8a9a"   # muted hints — brightened for readability
 
 # HP state colours (bright)
 HP_FULL       = "#00e676"
@@ -107,7 +107,7 @@ DANGER_BG     = "#3a1010";  DANGER_FG    = "#e05050";  DANGER_BD    = "#5a2020"
 # Entry fields / dialogs
 DLG_BG        = "#16202a"
 DLG_ENTRY_BG  = "#1e2c38"
-DLG_LABEL_FG  = "#6a8898"
+DLG_LABEL_FG  = "#7ea6b6"
 DLG_SEP       = "#243040"
 
 # Fonts
@@ -1052,9 +1052,9 @@ class ManagerWindow:
         row = tk.Frame(self._char_frame, bg=MGR_ROW,
                        highlightthickness=1,
                        highlightbackground="#2a4a5a" if is_open else MGR_BORDER2)
-        row.pack(fill="x", pady=3)
+        row.pack(fill="x", pady=5)
         inner = tk.Frame(row, bg=MGR_ROW)
-        inner.pack(fill="x", padx=8, pady=6)
+        inner.pack(fill="x", padx=10, pady=8)
 
         # Thumbnail
         thumb = 38
@@ -1143,7 +1143,7 @@ class ManagerWindow:
         try:
             img = Image.open(path).convert("RGBA").resize((size,size),Image.LANCZOS) \
                   if path else Image.new("RGBA",(size,size),MGR_ROW)
-            img = round_image(img, 5)
+            img = round_image(img, 8)
             photo = ImageTk.PhotoImage(img)
             canvas._photo = photo
             canvas.create_image(size//2, size//2, image=photo, anchor="center")
