@@ -1276,7 +1276,7 @@ class ManagerWindow:
             self._windows.pop(cid,None)
         self._hp_data.pop(cid,None)
         self._status.pop(cid,None)
-        self._row_widgets.pop(cid,None)
+        # keep the row widget refs — the row still exists, only its state needs updating
         self._update_status_bar()
 
     def _on_window_closed(self, cid):
