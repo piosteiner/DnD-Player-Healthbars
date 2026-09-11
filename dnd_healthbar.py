@@ -31,7 +31,7 @@ Requirements:
     pip install requests websocket-client Pillow
 """
 
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 
 import os, sys, json, time, threading, traceback
 import tkinter as tk
