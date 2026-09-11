@@ -219,7 +219,7 @@ def get_character(session: requests.Session, cookie: str, token: str,
         con_score = override_stats[3]
     else:
         con_score = base_stats.get(3, 10) + bonus_stats.get(3, 0)
-        for src in ("race", "feat", "class", "background"):
+        for src in ("race", "feat", "class", "background", "item", "condition"):
             for mod in char.get("modifiers", {}).get(src, []):
                 if mod.get("subType") == "constitution-score" and mod.get("type") == "bonus":
                     con_score += int(mod.get("value") or mod.get("fixedValue") or 0)
