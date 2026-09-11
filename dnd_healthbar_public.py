@@ -29,7 +29,7 @@ Requirements:
     pip install requests Pillow
 """
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.1"
 
 import os, sys, json, time, re, threading, traceback
 import tkinter as tk
