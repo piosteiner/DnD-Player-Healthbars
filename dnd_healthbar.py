@@ -31,7 +31,7 @@ Requirements:
     pip install requests websocket-client Pillow
 """
 
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 
 import os, sys, json, time, threading, traceback
 import tkinter as tk
@@ -219,10 +219,19 @@ def get_character(session: requests.Session, cookie: str, token: str,
         con_score = override_stats[3]
     else:
         con_score = base_stats.get(3, 10) + bonus_stats.get(3, 0)
+        con_set = None
         for src in ("race", "feat", "class", "background", "item", "condition"):
             for mod in char.get("modifiers", {}).get(src, []):
-                if mod.get("subType") == "constitution-score" and mod.get("type") == "bonus":
-                    con_score += int(mod.get("value") or mod.get("fixedValue") or 0)
+                if mod.get("subType") != "constitution-score":
+                    continue
+                mod_value = mod.get("value") or mod.get("fixedValue")
+                if mod.get("type") == "bonus":
+                    con_score += int(mod_value or 0)
+                elif mod.get("type") == "set" and mod_value is not None:
+                    # e.g. Amulet of Health: sets CON to a fixed value if higher
+                    con_set = max(con_set or 0, int(mod_value))
+        if con_set is not None:
+            con_score = max(con_score, con_set)
 
     return {
         "baseHitPoints":      int(char.get("baseHitPoints")      or 0),
