@@ -35,10 +35,10 @@ Requirements:
     pip install requests Pillow
 """
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 import os, sys, io, json, time, re, threading, traceback, queue
-import html, mimetypes, webbrowser, urllib.parse, http.server
+import html, mimetypes, webbrowser, urllib.parse, urllib.request, http.server
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk, ImageDraw, ImageChops
@@ -555,6 +555,8 @@ class _OverlayHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
         try:
+            if path == "/ping":
+                return self._send(200, "text/plain", PING_REPLY)
             if path in ("/", "/index.html"):
                 return self._send(200, "text/html; charset=utf-8",
                                   _overlay_index_html().encode("utf-8"))
@@ -589,15 +591,37 @@ class _OverlayHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+PING_REPLY = b"dnd-healthbar"
+
+class _ExclusiveHTTPServer(http.server.ThreadingHTTPServer):
+    # http.server enables SO_REUSEADDR, which on Windows lets a second process
+    # bind the *same* port — two app instances would then silently share 7777
+    # and OBS would talk to whichever Windows picks. Demand exclusive use.
+    allow_reuse_address = False
+    daemon_threads      = True
+
+    def server_bind(self):
+        import socket
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+def app_already_running(port: int) -> bool:
+    """True if another instance of this app is serving overlays on `port`."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/ping", timeout=1) as r:
+            return r.read() == PING_REPLY
+    except Exception:
+        return False
+
 def start_overlay_server(port: int) -> int | None:
     """Start the overlay HTTP server on 127.0.0.1. Tries `port` and the next
     9 ports if it is taken. Returns the port in use, or None."""
     for p in range(port, port + 10):
         try:
-            srv = http.server.ThreadingHTTPServer(("127.0.0.1", p), _OverlayHandler)
+            srv = _ExclusiveHTTPServer(("127.0.0.1", p), _OverlayHandler)
         except OSError:
             continue
-        srv.daemon_threads = True
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         OVERLAY_HUB.port = p
         return p
@@ -1873,11 +1897,21 @@ def main():
     cfg  = load_config()
     OVERLAY_HUB.sync_config(cfg)
     srv  = cfg.setdefault("overlay_server", {"enabled": True, "port": DEFAULT_OVERLAY_PORT})
+    try:
+        port = int(srv.get("port", DEFAULT_OVERLAY_PORT))
+    except (TypeError, ValueError):
+        port = DEFAULT_OVERLAY_PORT
+    # Single instance: a second copy would fight over the same characters and
+    # OBS overlays. The first copy may be hidden in the system tray.
+    if app_already_running(port):
+        r = tk.Tk(); r.withdraw()
+        messagebox.showinfo("D&D Health Bar",
+            "D&D Health Bar is already running.\n\n"
+            "Look for it in the system tray (bottom-right, near the clock) — "
+            "right-click the green ring icon and choose Show.")
+        r.destroy()
+        return
     if srv.get("enabled", True):
-        try:
-            port = int(srv.get("port", DEFAULT_OVERLAY_PORT))
-        except (TypeError, ValueError):
-            port = DEFAULT_OVERLAY_PORT
         start_overlay_server(port)
     root = tk.Tk()
     app  = ManagerWindow(root, cfg)
