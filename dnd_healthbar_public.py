@@ -1853,8 +1853,11 @@ class ManagerWindow:
     _tray = None
 
     def _setup_tray(self):
-        # Without pystray, closing the manager simply quits (set in __init__).
-        if HAS_TRAY:
+        # By default ✕ really quits (set in __init__). Hiding to the tray is
+        # opt-in via "close_to_tray": true in the config, because a silently
+        # running background process confuses people (file stays locked,
+        # second copy fights over the OBS overlay port).
+        if HAS_TRAY and self.cfg.get("close_to_tray", False):
             self.root.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
 
     def _make_tray_icon(self):
@@ -1918,6 +1921,9 @@ def main():
     app._setup_tray()
     root.after(50, _pump_ui_queue, root)
     root.mainloop()
+    # Window is gone and config saved — make sure no stray background thread
+    # (HTTP server, tray, a hung network request) keeps the process alive.
+    os._exit(0)
 
 if __name__ == "__main__":
     main()

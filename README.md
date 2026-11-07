@@ -161,15 +161,23 @@ one gets top/bottom bars. For best results use square images.
 
 ## System tray
 
-Install `pystray` to enable minimize-to-tray:
-```
-pip install pystray
-```
-When installed, closing the manager window sends it to the system tray
-instead of quitting. Right-click the tray icon to show or quit.
+Closing the manager window (✕) **quits the app** and closes all overlay
+windows.
 
-This is included automatically in the pre-built binaries from the
-Releases page.
+If you'd rather have ✕ hide the manager in the system tray (while overlays
+keep running), add this to the config file:
+
+```json
+"close_to_tray": true
+```
+
+Right-click the tray icon (green ring, near the clock — it may be hidden
+behind the **^** arrow) to show the manager again or quit. Tray support is
+included in the pre-built binaries; when running from source it needs
+`pip install pystray`.
+
+Only one copy of the app can run at a time. Starting it again while it is
+already running shows a message instead of opening a second copy.
 
 ---
 
