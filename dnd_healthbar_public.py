@@ -33,11 +33,14 @@ OBS browser source:
 
 Requirements:
     pip install requests Pillow
+Optional:
+    pip install websocket-client   (add overlays to OBS automatically)
+    pip install pystray            (close-to-tray)
 """
 
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 
-import os, sys, io, json, time, re, threading, traceback, queue
+import os, sys, io, json, time, re, threading, traceback, queue, hashlib, base64
 import html, mimetypes, webbrowser, urllib.parse, urllib.request, http.server
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -51,6 +54,13 @@ try:
     HAS_TRAY = True
 except ImportError:
     HAS_TRAY = False
+
+# OBS WebSocket support (optional — pip install websocket-client)
+try:
+    import websocket
+    HAS_WEBSOCKET = True
+except ImportError:
+    HAS_WEBSOCKET = False
 
 # ---------------------------------------------------------------------------
 # API
@@ -447,22 +457,27 @@ OVERLAY_HUB = OverlayHub()
 OVERLAY_HTML = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>HP overlay</title>
 <style>
+  /* All sizes are in design pixels (280 wide) times --u, which JS sets so the
+     whole overlay fits inside the browser source whatever its width/height. */
+  :root{--u:1px}
   html,body{margin:0;padding:0;background:transparent;overflow:hidden;
             font-family:"Segoe UI",system-ui,sans-serif}
-  #wrap{width:100vw;box-sizing:border-box;opacity:0;transition:opacity .4s ease}
+  #wrap{width:calc(var(--u)*280);margin:0 auto;box-sizing:border-box;
+        opacity:0;transition:opacity .4s ease}
   #wrap.show{opacity:1}
-  body.card #wrap{background:#293136;border-radius:5vw}
-  #portrait{display:block;width:100vw;height:100vw;object-fit:contain}
+  body.card #wrap{background:#293136;border-radius:calc(var(--u)*14)}
+  #portrait{display:block;width:calc(var(--u)*280);height:calc(var(--u)*280);object-fit:contain}
   #portrait.empty{visibility:hidden}
-  #hp{padding:4.3vw}
-  #track{position:relative;height:11.43vw;border-radius:5.71vw;
+  #hp{padding:calc(var(--u)*12)}
+  #track{position:relative;height:calc(var(--u)*32);border-radius:calc(var(--u)*16);
          background:#1e272e;overflow:hidden}
-  #track.unknown{background:repeating-linear-gradient(90deg,#1e272e 0 2vw,#2a3a44 2vw 4.3vw)}
-  #fill{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:5.71vw;
+  #track.unknown{background:repeating-linear-gradient(90deg,#1e272e 0 calc(var(--u)*6),
+                 #2a3a44 calc(var(--u)*6) calc(var(--u)*12))}
+  #fill{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:calc(var(--u)*16);
         transition:width .6s ease,background-color .6s ease}
-  #nums{display:none;margin-top:2.1vw;color:#dce8f0;white-space:pre;
-        font:bold 5.2vw Consolas,"Courier New",monospace;
-        text-shadow:0 0 .6vw #000,0 0 .6vw #000}
+  #nums{display:none;margin-top:calc(var(--u)*6);color:#dce8f0;white-space:pre;
+        font:bold calc(var(--u)*15) Consolas,"Courier New",monospace;
+        text-shadow:0 0 calc(var(--u)*2) #000,0 0 calc(var(--u)*2) #000}
 </style></head>
 <body>
 <div id="wrap">
@@ -475,7 +490,15 @@ OVERLAY_HTML = r"""<!doctype html>
   if (params.get("card") === "1") document.body.classList.add("card");
   const always = params.get("always") === "1";
   const $ = id => document.getElementById(id);
-  let lastSrc = null;
+  let lastSrc = null, showNums = false;
+  // Design size: 280 x 340 (280 x 370 with HP numbers). Scale to fit.
+  function fit() {
+    const h = showNums ? 370 : 340;
+    const u = Math.min(innerWidth / 280, innerHeight / h);
+    document.documentElement.style.setProperty("--u", u + "px");
+  }
+  addEventListener("resize", fit);
+  fit();
   async function tick() {
     try {
       const r = await fetch(`/api/${cid}`, {cache: "no-store"});
@@ -499,6 +522,7 @@ OVERLAY_HTML = r"""<!doctype html>
         $("nums").textContent = `${s.cur}  /  ${s.mx}`;
       }
       $("nums").style.display = s.show_hp_numbers ? "block" : "none";
+      if (s.show_hp_numbers !== showNums) { showNums = s.show_hp_numbers; fit(); }
     } catch (e) {
       if (!always) $("wrap").classList.remove("show");   // app closed
     }
@@ -533,7 +557,7 @@ def _overlay_index_html() -> str:
 </style></head><body>
 <h1>D&amp;D Health Bar — OBS overlays</h1>
 <p>In OBS add a <b>Browser</b> source, paste a URL below, and set the size to
-<b>280 × 340</b> (or any width — the overlay scales). The overlay appears when you
+<b>280 × 340</b> (any size works — the overlay scales to fit). The overlay appears when you
 open the character in the app and fades out when you close it.
 Add <code>?card=1</code> for the dark card background, or <code>?always=1</code> to keep it visible.</p>
 <table><tr><th>Game</th><th>Character</th><th>Overlay URL</th><th></th></tr>
@@ -627,6 +651,159 @@ def start_overlay_server(port: int) -> int | None:
         return p
     print(f"Warning: could not start overlay server on ports {port}-{port+9}")
     return None
+
+# ---------------------------------------------------------------------------
+# OBS WebSocket (v5 protocol, built into OBS 28+)
+# ---------------------------------------------------------------------------
+# Lets the app create/update the browser sources in OBS itself, so the user
+# never has to copy URLs or set sizes by hand.
+OBS_DEFAULTS     = {"host": "127.0.0.1", "port": 4455, "password": "", "scene": ""}
+OBS_SOURCE_W     = 280
+OBS_SOURCE_H     = 340
+OBS_SOURCE_H_NUM = 370
+
+class OBSError(Exception):
+    def __init__(self, msg: str, code=None):
+        super().__init__(msg)
+        self.code = code
+
+class OBSClient:
+    """Minimal synchronous obs-websocket v5 client. Use as a context manager."""
+
+    def __init__(self, host="127.0.0.1", port=4455, password="", timeout=5.0):
+        self.host, self.port, self.password, self.timeout = host, int(port), password, timeout
+        self._ws = None
+        self._req = 0
+
+    def __enter__(self):
+        if not HAS_WEBSOCKET:
+            raise OBSError("OBS support needs the 'websocket-client' package.")
+        try:
+            self._ws = websocket.create_connection(
+                f"ws://{self.host}:{self.port}", timeout=self.timeout,
+                subprotocols=["obswebsocket.json"])
+        except Exception:
+            raise OBSError(f"Can't reach OBS at {self.host}:{self.port}.\n\n"
+                           "Is OBS running, and is the WebSocket server enabled?\n"
+                           "(OBS → Tools → WebSocket Server Settings)")
+        try:
+            hello = self._recv_op(0)
+            ident = {"rpcVersion": 1, "eventSubscriptions": 0}
+            auth  = hello.get("authentication")
+            if auth:
+                if not self.password:
+                    raise OBSError("OBS asks for a WebSocket password — enter it in the "
+                                   "OBS settings of this app.")
+                secret = base64.b64encode(hashlib.sha256(
+                    (self.password + auth["salt"]).encode()).digest()).decode()
+                ident["authentication"] = base64.b64encode(hashlib.sha256(
+                    (secret + auth["challenge"]).encode()).digest()).decode()
+            self._send(1, ident)
+            try:
+                self._recv_op(2)
+            except OBSError:
+                raise
+            except Exception:
+                raise OBSError("OBS refused the connection — the WebSocket password is wrong.")
+        except Exception:
+            self.close()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        if self._ws:
+            try: self._ws.close()
+            except Exception: pass
+            self._ws = None
+
+    def _send(self, op: int, d: dict):
+        self._ws.send(json.dumps({"op": op, "d": d}))
+
+    def _recv_op(self, op: int) -> dict:
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            msg = json.loads(self._ws.recv())
+            if msg.get("op") == op:
+                return msg.get("d", {})
+        raise OBSError("OBS did not answer in time.")
+
+    def call(self, request_type: str, data: dict | None = None) -> dict:
+        self._req += 1
+        rid = str(self._req)
+        self._send(6, {"requestType": request_type, "requestId": rid,
+                       "requestData": data or {}})
+        while True:
+            d = self._recv_op(7)
+            if d.get("requestId") == rid:
+                break
+        status = d.get("requestStatus", {})
+        if not status.get("result"):
+            raise OBSError(f"OBS: {request_type} failed — "
+                           f"{status.get('comment') or 'error ' + str(status.get('code'))}",
+                           status.get("code"))
+        return d.get("responseData") or {}
+
+def obs_settings(cfg: dict) -> dict:
+    s = dict(OBS_DEFAULTS)
+    s.update(cfg.get("obs") or {})
+    return s
+
+def obs_list_scenes(obs: dict) -> list[str]:
+    with OBSClient(obs["host"], obs["port"], obs["password"]) as c:
+        return [s["sceneName"] for s in reversed(c.call("GetSceneList").get("scenes", []))]
+
+def obs_source_name(char_name: str) -> str:
+    return f"HP Overlay - {char_name}"
+
+def obs_add_overlays(obs: dict, items: list[dict]) -> tuple[str, int, int]:
+    """Create or update one browser source per item in the target scene.
+    items: [{"name", "url", "height", "slot"}]; slot = position index for
+    newly created sources so they don't stack on top of each other.
+    Returns (scene, created, updated)."""
+    with OBSClient(obs["host"], obs["port"], obs["password"]) as c:
+        scene = obs.get("scene") or ""
+        if not scene:
+            cur   = c.call("GetCurrentProgramScene")
+            scene = cur.get("currentProgramSceneName") or cur.get("sceneName")
+        existing = {i["inputName"]: i.get("inputKind")
+                    for i in c.call("GetInputList").get("inputs", [])}
+        created = updated = 0
+        for it in items:
+            name     = obs_source_name(it["name"])
+            settings = {"url": it["url"], "width": OBS_SOURCE_W, "height": it["height"],
+                        "shutdown": False, "restart_when_active": False}
+            new_item = None
+            if name in existing:
+                if existing[name] != "browser_source":
+                    raise OBSError(f"OBS already has a non-browser source named '{name}'. "
+                                   "Rename or delete it and try again.")
+                c.call("SetInputSettings", {"inputName": name, "inputSettings": settings,
+                                            "overlay": True})
+                try:
+                    c.call("GetSceneItemId", {"sceneName": scene, "sourceName": name})
+                except OBSError as e:
+                    if e.code != 600:   # 600 = ResourceNotFound → not in this scene yet
+                        raise
+                    new_item = c.call("CreateSceneItem", {"sceneName": scene,
+                                                          "sourceName": name})["sceneItemId"]
+                updated += 1
+            else:
+                new_item = c.call("CreateInput", {
+                    "sceneName": scene, "inputName": name, "inputKind": "browser_source",
+                    "inputSettings": settings, "sceneItemEnabled": True})["sceneItemId"]
+                created += 1
+            if new_item is not None:
+                try:   # side by side along the top edge
+                    c.call("SetSceneItemTransform", {
+                        "sceneName": scene, "sceneItemId": new_item,
+                        "sceneItemTransform": {"positionX": 20 + it.get("slot", 0) * 300,
+                                               "positionY": 20}})
+                except OBSError:
+                    pass
+        return scene, created, updated
 
 # ---------------------------------------------------------------------------
 # Window position helpers
@@ -1167,6 +1344,125 @@ class GameDialog(tk.Toplevel):
         self.destroy()
 
 # ---------------------------------------------------------------------------
+# OBS connection dialog
+# ---------------------------------------------------------------------------
+class OBSDialog(tk.Toplevel):
+    CURRENT = "(current scene)"
+
+    def __init__(self, parent, obs: dict, allow_add_all: bool = False):
+        super().__init__(parent)
+        self.title("OBS connection")
+        self.configure(bg=DLG_BG)
+        self.resizable(False, False)
+        self.grab_set()
+        self.result  = None
+        self.add_all = False
+
+        hdr = tk.Frame(self, bg=MGR_HEADER)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="OBS connection", bg=MGR_HEADER, fg=T_PRIMARY,
+                 font=F_BOLD, anchor="w").pack(side="left", padx=14, pady=10)
+        mk_sep(self, MGR_BORDER)
+
+        body = tk.Frame(self, bg=DLG_BG)
+        body.pack(fill="x", padx=14, pady=10)
+        tk.Label(body, justify="left", wraplength=380, bg=DLG_BG, fg=T_DIM, font=F_TINY,
+                 text="In OBS open Tools → WebSocket Server Settings, tick "
+                      "\"Enable WebSocket server\", then click \"Show Connect Info\" "
+                      "and copy the port and password here.").pack(anchor="w", pady=(0,4))
+
+        self._vars = {}
+        for key, label, show in [("host","HOST",""), ("port","PORT",""),
+                                 ("password","PASSWORD","*")]:
+            tk.Label(body, text=label, bg=DLG_BG, fg=DLG_LABEL_FG,
+                     font=("Segoe UI",8,"bold")).pack(anchor="w", pady=(6,2))
+            var = tk.StringVar(value=str(obs.get(key, "")))
+            self._vars[key] = var
+            e = styled_entry(body, var, width=42)
+            if show: e.config(show=show)
+            e.pack(fill="x", ipady=4, pady=(0,2))
+
+        tk.Label(body, text="ADD OVERLAYS TO SCENE", bg=DLG_BG, fg=DLG_LABEL_FG,
+                 font=("Segoe UI",8,"bold")).pack(anchor="w", pady=(8,2))
+        scene_row = tk.Frame(body, bg=DLG_BG)
+        scene_row.pack(fill="x")
+        self._scene_var = tk.StringVar(value=obs.get("scene") or self.CURRENT)
+        self._scene_menu = tk.OptionMenu(scene_row, self._scene_var, self._scene_var.get())
+        self._scene_menu.config(bg=DLG_ENTRY_BG, fg=T_PRIMARY, activebackground=MGR_BORDER2,
+                                activeforeground=T_PRIMARY, relief="flat", bd=0,
+                                highlightthickness=1, highlightbackground=MGR_BORDER3,
+                                font=F_SMALL, anchor="w")
+        self._scene_menu["menu"].config(bg=MGR_PILL, fg=T_PRIMARY, font=F_SMALL)
+        self._scene_menu.pack(side="left", fill="x", expand=True, ipady=2, padx=(0,6))
+        styled_button(scene_row, "Test & load scenes", BTN_EDIT_BG, BTN_EDIT_FG, BTN_EDIT_BD,
+                      self._test).pack(side="left", ipady=3, ipadx=6)
+
+        self._status = tk.Label(body, text="", bg=DLG_BG, fg=T_DIM, font=F_TINY,
+                                wraplength=380, justify="left")
+        self._status.pack(anchor="w", pady=(6,0))
+
+        mk_sep(self, MGR_BORDER)
+        foot = tk.Frame(self, bg=MGR_HEADER)
+        foot.pack(fill="x", padx=14, pady=8)
+        if allow_add_all:
+            styled_button(foot, "Save & add all characters", BTN_OPEN_BG, BTN_OPEN_FG,
+                          BTN_OPEN_BD, self._save_and_add_all).pack(side="left", ipady=4, ipadx=8)
+        styled_button(foot, "Cancel", BTN_CANCEL_BG, BTN_CANCEL_FG, BTN_CANCEL_BD,
+                      self.destroy).pack(side="right", padx=(4,0), ipady=4, ipadx=8)
+        styled_button(foot, "Save", BTN_SAVE_BG, BTN_SAVE_FG, BTN_SAVE_BD,
+                      self._submit, font=F_MED).pack(side="right", ipady=4, ipadx=12)
+
+    def _values(self) -> dict | None:
+        try:
+            port = int(self._vars["port"].get().strip())
+        except ValueError:
+            messagebox.showwarning("OBS", "Port must be a number (usually 4455).", parent=self)
+            return None
+        scene = self._scene_var.get()
+        return {"host": self._vars["host"].get().strip() or "127.0.0.1", "port": port,
+                "password": self._vars["password"].get(),
+                "scene": "" if scene == self.CURRENT else scene}
+
+    def _test(self):
+        obs = self._values()
+        if obs is None: return
+        self._status.config(text="Connecting…", fg=T_DIM)
+        def work():
+            try:
+                scenes = obs_list_scenes(obs)
+                run_on_ui(lambda: self._test_done(scenes, None))
+            except Exception as e:
+                msg = str(e)
+                run_on_ui(lambda: self._test_done(None, msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _test_done(self, scenes, err):
+        if not self.winfo_exists(): return
+        if err:
+            self._status.config(text=f"✗ {err}", fg=HP_CRIT)
+            return
+        menu = self._scene_menu["menu"]
+        menu.delete(0, "end")
+        for name in [self.CURRENT] + scenes:
+            menu.add_command(label=name, command=lambda v=name: self._scene_var.set(v))
+        if self._scene_var.get() not in [self.CURRENT] + scenes:
+            self._scene_var.set(self.CURRENT)
+        self._status.config(text=f"✓ Connected — {len(scenes)} scenes found.", fg=HP_FULL)
+
+    def _submit(self):
+        obs = self._values()
+        if obs is None: return
+        self.result = obs
+        self.destroy()
+
+    def _save_and_add_all(self):
+        obs = self._values()
+        if obs is None: return
+        self.result  = obs
+        self.add_all = True   # manager adds the overlays after saving settings
+        self.destroy()
+
+# ---------------------------------------------------------------------------
 # Manager window
 # ---------------------------------------------------------------------------
 class ManagerWindow:
@@ -1207,9 +1503,15 @@ class ManagerWindow:
         tk.Label(tcol, text=f"v{APP_VERSION}  ·  public characters only  ·  no credentials required",
                  bg=MGR_HEADER, fg=T_DIM, font=F_TINY).pack(anchor="w")
         if OVERLAY_HUB.port:
-            obs_lbl = tk.Label(hdr, text="OBS overlays ↗", bg=MGR_HEADER, fg=BTN_OPEN_FG,
+            links = tk.Frame(hdr, bg=MGR_HEADER)
+            links.pack(side="right", padx=12)
+            obs_set = tk.Label(links, text="OBS ⚙", bg=MGR_HEADER, fg=BTN_OPEN_FG,
+                               font=F_SMALL, cursor="hand2")
+            obs_set.pack(anchor="e")
+            obs_set.bind("<Button-1>", lambda _e: self._open_obs_dialog())
+            obs_lbl = tk.Label(links, text="Overlay URLs ↗", bg=MGR_HEADER, fg=T_DIM,
                                font=F_TINY, cursor="hand2")
-            obs_lbl.pack(side="right", padx=12)
+            obs_lbl.pack(anchor="e")
             obs_lbl.bind("<Button-1>", lambda _e: webbrowser.open(
                 f"http://127.0.0.1:{OVERLAY_HUB.port}/"))
         mk_sep(self.root, MGR_BORDER)
@@ -1611,9 +1913,11 @@ class ManagerWindow:
         open_btn.pack(side="left", padx=(0,3), ipady=4)
         self._row_widgets[cid]["open_btn"] = open_btn
 
-        styled_button(btns,"OBS",BTN_EDIT_BG,BTN_EDIT_FG,BTN_EDIT_BD,
-                      lambda c=ch: self._copy_overlay_url(c),
-                      font=F_TINY).pack(side="left",padx=(0,3),ipady=4,ipadx=2)
+        obs_btn = styled_button(btns,"OBS",BTN_EDIT_BG,BTN_EDIT_FG,BTN_EDIT_BD,
+                                lambda c=ch: self._send_to_obs([c]), font=F_TINY)
+        obs_btn.pack(side="left",padx=(0,3),ipady=4,ipadx=2)
+        # Right-click: just copy the browser-source URL
+        obs_btn.bind("<Button-3>", lambda _e, c=ch: self._copy_overlay_url(c))
 
         styled_button(btns,"✎",BTN_EDIT_BG,BTN_EDIT_FG,BTN_EDIT_BD,
                       lambda c=ch,g=game: self._edit_character(c,g),width=3).pack(side="left",padx=(0,3),ipady=4)
@@ -1750,6 +2054,68 @@ class ManagerWindow:
                     pass
             self._update_status_bar()
         run_on_ui(_do)
+
+    # ── OBS integration ──────────────────────────────────────────────────────
+    def _open_obs_dialog(self, then_send: list | None = None):
+        g   = self._current_game()
+        dlg = OBSDialog(self.root, obs_settings(self.cfg),
+                        allow_add_all=bool(g and g.get("characters")))
+        self.root.wait_window(dlg)
+        if not dlg.result:
+            return
+        self.cfg["obs"] = dlg.result
+        save_config(self.cfg)
+        if dlg.add_all and g:
+            self._send_to_obs(g.get("characters", []))
+        elif then_send:
+            self._send_to_obs(then_send)
+
+    def _send_to_obs(self, chars: list):
+        """Create/update browser sources in OBS for these characters."""
+        if not chars: return
+        if not OVERLAY_HUB.port:
+            messagebox.showwarning("OBS overlay",
+                "The overlay server is not running (port in use or disabled in the config).",
+                parent=self.root)
+            return
+        if not self.cfg.get("obs"):
+            # First use: ask for the connection details, then continue
+            self._open_obs_dialog(then_send=chars)
+            return
+        g       = self._current_game()
+        order   = [c["character_id"] for c in (g.get("characters", []) if g else [])]
+        items   = [{"name": ch.get("name") or ch["character_id"],
+                    "url": OVERLAY_HUB.url_for(ch["character_id"]),
+                    "height": OBS_SOURCE_H_NUM if ch.get("show_hp_numbers") else OBS_SOURCE_H,
+                    "slot": order.index(ch["character_id"]) if ch["character_id"] in order else 0}
+                   for ch in chars]
+        obs     = obs_settings(self.cfg)
+        label   = chars[0].get("name", "?") if len(chars) == 1 else f"{len(chars)} characters"
+        self._status_label.config(text=f"Sending {label} to OBS…", fg=T_DIM)
+
+        def work():
+            try:
+                scene, created, updated = obs_add_overlays(obs, items)
+                run_on_ui(lambda: self._obs_done(label, scene, created, updated, None))
+            except Exception as e:
+                msg = str(e)
+                run_on_ui(lambda: self._obs_done(label, None, 0, 0, msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _obs_done(self, label, scene, created, updated, err):
+        if err:
+            self._status_label.config(text="OBS: failed", fg=HP_CRIT)
+            if messagebox.askyesno("OBS",
+                    f"{err}\n\nOpen the OBS connection settings?", parent=self.root):
+                self._open_obs_dialog()
+            return
+        parts = []
+        if created: parts.append(f"{created} added")
+        if updated: parts.append(f"{updated} updated")
+        self._status_label.config(
+            text=f"OBS: {label} → scene '{scene}' ({', '.join(parts)}). "
+                 f"Press ▶ to show a character on stream.", fg=HP_FULL)
+        self.root.after(6000, self._update_status_bar)
 
     def _copy_overlay_url(self, ch):
         url = OVERLAY_HUB.url_for(ch["character_id"])

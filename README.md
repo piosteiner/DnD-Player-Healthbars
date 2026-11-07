@@ -50,26 +50,44 @@ for your OS:
 Run it directly — no installation, no Python required.
 
 On first launch it creates **`dnd_healthbar_public.json`** next to the
-binary. This is your config file and contains no sensitive data.
+binary. This is your config file. It contains no D&D Beyond credentials
+(only your local OBS WebSocket password, if you set one).
 
 ---
 
 ## Using with OBS Studio
 
-### Recommended: Browser Source
-
 While the app is running it serves every character as a small web page that
-OBS can show directly — no window capture needed. This gives you a
+OBS shows as a **Browser Source** — no window capture needed. This gives you a
 **transparent background**, works even when the overlay windows are minimised
-or covered, and never mixes up windows.
+or covered, and never mixes up windows. The overlay scales to fit whatever
+size the source has.
 
-1. In the manager, click the **OBS** button on a character row — the overlay
-   URL (e.g. `http://127.0.0.1:7777/overlay/2222222`) is copied to your
-   clipboard. Or click **OBS overlays ↗** in the header to see all URLs.
-2. In OBS: **Sources → + → Browser**, paste the URL, set the size to
-   **280 × 340** (any width works — the overlay scales to fit).
-3. Press **▶** on the character in the manager. The overlay fades in on stream
+### Recommended: let the app add the sources (OBS WebSocket)
+
+1. In OBS: **Tools → WebSocket Server Settings** → tick **Enable WebSocket
+   server** → click **Show Connect Info** to see the port and password.
+2. In the app, click **OBS ⚙** in the header, enter the port and password,
+   click **Test & load scenes** and pick the scene the overlays should go into
+   (or leave *(current scene)*).
+3. Click **Save & add all characters** — or the **OBS** button on a single
+   character row. The app creates a Browser source named
+   `HP Overlay - <name>` with the right URL and size. Clicking again updates
+   the existing source instead of making a duplicate.
+4. Press **▶** on the character in the manager. The overlay fades in on stream
    and follows HP live; press **■** and it fades out again.
+
+The WebSocket password is stored in the config file. It only grants control of
+OBS on your own PC.
+
+### Manual: add a Browser source yourself
+
+1. Right-click the **OBS** button on a character row to copy its overlay URL
+   (e.g. `http://127.0.0.1:7777/overlay/2222222`), or click **Overlay URLs ↗**
+   in the header to see all URLs.
+2. In OBS: **Sources → + → Browser**, paste the URL, set the size to
+   **280 × 340** (280 × 370 with HP numbers).
+3. Press **▶** on the character in the manager.
 
 URL options:
 
@@ -101,7 +119,7 @@ Overlay windows reopen where you last left them.
 ## Config file (`dnd_healthbar_public.json`)
 
 Lives next to the executable. Editable in any text editor.
-**Contains no sensitive data.**
+**Contains no D&D Beyond credentials.**
 
 ```json
 {
@@ -133,6 +151,12 @@ Lives next to the executable. Editable in any text editor.
   "overlay_server": {
     "enabled": true,
     "port": 7777
+  },
+  "obs": {
+    "host": "127.0.0.1",
+    "port": 4455,
+    "password": "",
+    "scene": ""
   }
 }
 ```

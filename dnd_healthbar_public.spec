@@ -12,6 +12,7 @@ a = Analysis(
     hiddenimports=[
         'PIL._tkinter_finder',
         'requests',
+        'websocket',         # OBS WebSocket integration (websocket-client)
         'pystray',
         'pystray._win32',    # Windows tray backend
         'pystray._xorg',     # Linux tray backend
