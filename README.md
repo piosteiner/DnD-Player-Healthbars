@@ -52,6 +52,51 @@ Run it directly — no installation, no Python required.
 On first launch it creates **`dnd_healthbar_public.json`** next to the
 binary. This is your config file and contains no sensitive data.
 
+---
+
+## Using with OBS Studio
+
+### Recommended: Browser Source
+
+While the app is running it serves every character as a small web page that
+OBS can show directly — no window capture needed. This gives you a
+**transparent background**, works even when the overlay windows are minimised
+or covered, and never mixes up windows.
+
+1. In the manager, click the **OBS** button on a character row — the overlay
+   URL (e.g. `http://127.0.0.1:7777/overlay/2222222`) is copied to your
+   clipboard. Or click **OBS overlays ↗** in the header to see all URLs.
+2. In OBS: **Sources → + → Browser**, paste the URL, set the size to
+   **280 × 340** (any width works — the overlay scales to fit).
+3. Press **▶** on the character in the manager. The overlay fades in on stream
+   and follows HP live; press **■** and it fades out again.
+
+URL options:
+
+| Option      | Effect                                                   |
+|-------------|----------------------------------------------------------|
+| `?card=1`   | Dark card background, like the desktop window            |
+| `?always=1` | Keep the overlay visible even when the character is closed |
+
+The server only listens on `127.0.0.1` (your own PC). If port 7777 is taken it
+tries 7778–7786. Change or disable it in the config file:
+
+```json
+"overlay_server": { "enabled": true, "port": 7777 }
+```
+
+### Alternative: Window Capture
+
+All the app's windows share the same window class and executable, so OBS's
+default matching ("Match title, otherwise find window of same type") falls back
+to the **manager** window whenever the character window isn't open yet — and
+then sticks with it. To prevent this, open the Window Capture source's
+properties and set **Window Match Priority → "Window title must match"**. OBS
+will then wait for the window titled with the character's name and pick it up
+as soon as you open it. Character names must be unique for this to work.
+
+Overlay windows reopen where you last left them.
+
 
 ## Config file (`dnd_healthbar_public.json`)
 
@@ -70,6 +115,7 @@ Lives next to the executable. Editable in any text editor.
           "always_on_top":      false,
           "show_hp_numbers":    false,
           "opacity":            1.0,
+          "window_pos":         [100, 100],
           "portrait_unscathed": "/path/to/full.png",
           "portrait_scratched": "/path/to/scratched.png",
           "portrait_injured":   "/path/to/injured.png",
@@ -83,6 +129,10 @@ Lives next to the executable. Editable in any text editor.
   "sort": {
     "mode": "alpha_asc",
     "live_on_top": true
+  },
+  "overlay_server": {
+    "enabled": true,
+    "port": 7777
   }
 }
 ```

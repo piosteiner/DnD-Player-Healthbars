@@ -14,6 +14,7 @@ Data model:
           "character_id":       "2222222",
           "always_on_top":      false,
           "show_hp_numbers":    false,
+          "window_pos":         [100, 100],
           "portrait_unscathed": "/path/to/full.png",
           "portrait_scratched": "/path/to/scratched.png",
           "portrait_injured":   "/path/to/injured.png",
@@ -24,17 +25,23 @@ Data model:
       ]
     }
   ]
+  overlay_server: {"enabled": true, "port": 7777}
+
+OBS browser source:
+  While the app runs it serves each character's overlay at
+  http://127.0.0.1:7777/overlay/<character_id>  (localhost only).
 
 Requirements:
     pip install requests Pillow
 """
 
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.1.0"
 
-import os, sys, json, time, re, threading, traceback
+import os, sys, io, json, time, re, threading, traceback, queue
+import html, mimetypes, webbrowser, urllib.parse, http.server
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageChops
 import requests
 
 # System tray support (optional — falls back to normal minimize if not installed)
@@ -127,6 +134,8 @@ def save_config(cfg: dict):
             json.dump(cfg, f, indent=2)
     except Exception as e:
         print(f"Warning: could not save config: {e}")
+    # Keep the browser overlays in sync with names / portraits / toggles
+    OVERLAY_HUB.sync_config(cfg)
 
 # ---------------------------------------------------------------------------
 # API helpers — no auth required
@@ -181,6 +190,26 @@ def get_character(session: requests.Session, character_id: str) -> dict:
         if con_set is not None:
             con_score = max(con_score, con_set)
 
+    # Flat "+N HP per level" bonuses (Tough feat, Hill Dwarf, Draconic
+    # Resilience, ...). Class features scale with the level of the class
+    # that grants them; everything else scales with total character level.
+    feature_class_level = {}
+    for c in char.get("classes", []):
+        for f in c.get("classFeatures", []) or []:
+            fid = (f.get("definition") or {}).get("id")
+            if fid is not None:
+                feature_class_level[fid] = c.get("level", 0)
+    hp_per_level_bonus = 0
+    for src in ("race", "feat", "class", "background"):
+        for mod in char.get("modifiers", {}).get(src, []):
+            if mod.get("type") != "bonus" or mod.get("subType") != "hit-points-per-level":
+                continue
+            per_level = int(mod.get("value") or mod.get("fixedValue") or 0)
+            levels    = total_level
+            if src == "class":
+                levels = feature_class_level.get(mod.get("componentId"), total_level)
+            hp_per_level_bonus += per_level * levels
+
     return {
         "api_name":           char.get("name", ""),
         "baseHitPoints":      int(char.get("baseHitPoints")      or 0),
@@ -190,6 +219,7 @@ def get_character(session: requests.Session, character_id: str) -> dict:
         "temporaryHitPoints": int(char.get("temporaryHitPoints") or 0),
         "totalLevel":         total_level,
         "conMod":             (con_score - 10) // 2,
+        "hpPerLevelBonus":    hp_per_level_bonus,
     }
 
 
@@ -199,7 +229,8 @@ def calculate_hp(d: dict) -> tuple[float | None, int, int]:
     if override is not None:
         max_hp = int(override)
     else:
-        max_hp = d["baseHitPoints"] + d["totalLevel"] * d["conMod"] + d["bonusHitPoints"]
+        max_hp = (d["baseHitPoints"] + d["totalLevel"] * d["conMod"]
+                  + d.get("hpPerLevelBonus", 0) + d["bonusHitPoints"])
 
     if max_hp <= 0:
         return None, 0, 0   # character not configured yet
@@ -237,7 +268,9 @@ def round_image(img: Image.Image, radius: int) -> Image.Image:
     img  = img.convert("RGBA")
     mask = Image.new("L", img.size, 0)
     ImageDraw.Draw(mask).rounded_rectangle([0,0,img.width,img.height], radius=radius, fill=255)
-    img.putalpha(mask)
+    # Combine with existing alpha so transparent areas (letterbox, PNG
+    # transparency) stay transparent instead of turning opaque black.
+    img.putalpha(ImageChops.multiply(img.getchannel("A"), mask))
     return img
 
 def fit_image(img: Image.Image, size: int, bg_color: str) -> Image.Image:
@@ -254,6 +287,340 @@ def fit_image(img: Image.Image, size: int, bg_color: str) -> Image.Image:
     y_off  = (size - new_h) // 2
     canvas.paste(img, (x_off, y_off), img)
     return canvas
+
+# ---------------------------------------------------------------------------
+# Thread-safe UI dispatch
+# ---------------------------------------------------------------------------
+# Tkinter must only be touched from the main thread. Worker threads (HP
+# polling, connection tests, tray menu) put callables on this queue and the
+# main loop drains it periodically.
+_ui_queue: "queue.Queue" = queue.Queue()
+
+def run_on_ui(fn):
+    _ui_queue.put(fn)
+
+def _pump_ui_queue(root: tk.Tk):
+    try:
+        while True:
+            fn = _ui_queue.get_nowait()
+            try:
+                fn()
+            except tk.TclError:
+                pass   # widget was destroyed meanwhile
+            except Exception:
+                traceback.print_exc()
+    except queue.Empty:
+        pass
+    try:
+        root.after(50, _pump_ui_queue, root)
+    except tk.TclError:
+        pass   # root destroyed — app is quitting
+
+# ---------------------------------------------------------------------------
+# Portrait resolution (shared by desktop window and browser overlay)
+# ---------------------------------------------------------------------------
+PORTRAIT_KEYS = ["portrait_unscathed","portrait_scratched","portrait_injured",
+                 "portrait_bloodied","portrait_critical","portrait_dead"]
+_STATE_TO_KEY = {"full":"portrait_unscathed","scratched":"portrait_scratched",
+                 "injured":"portrait_injured","bloodied":"portrait_bloodied",
+                 "critical":"portrait_critical","dead":"portrait_dead",
+                 "unknown":"portrait_unscathed"}
+
+def resolve_portrait_key(char: dict, pct) -> str:
+    """Find the best available portrait slot for the current HP state.
+
+    Starts at the ideal state and walks outward in both directions,
+    alternating closer-healthier then closer-worse, so the nearest
+    portrait is always preferred over a distant one.
+
+    Example for bloodied (idx=3), walk order:
+        bloodied(3) → injured(2) → critical(4) → scratched(1) → dead(5) → unscathed(0)
+    """
+    idx   = PORTRAIT_KEYS.index(_STATE_TO_KEY[hp_state(pct)])
+    n     = len(PORTRAIT_KEYS)
+    order = [idx]
+    for offset in range(1, n):
+        if idx - offset >= 0: order.append(idx - offset)
+        if idx + offset < n:  order.append(idx + offset)
+    for i in order:
+        key = PORTRAIT_KEYS[i]
+        p   = char.get(key, "")
+        if p and os.path.isfile(p):
+            return key
+    return ""
+
+# ---------------------------------------------------------------------------
+# Browser-source overlay server (for OBS)
+# ---------------------------------------------------------------------------
+DEFAULT_OVERLAY_PORT = 7777
+
+class OverlayHub:
+    """Thread-safe snapshot of everything the browser overlays need.
+    Written from the Tk main thread, read from HTTP server threads."""
+
+    def __init__(self):
+        self._lock   = threading.Lock()
+        self._chars: dict[str, dict] = {}   # cid → config snapshot
+        self._live:  dict[str, dict] = {}   # cid → latest HP (only while window open)
+        self._img_cache: dict[tuple, bytes] = {}
+        self.port: int | None = None
+
+    def url_for(self, cid: str) -> str | None:
+        return f"http://127.0.0.1:{self.port}/overlay/{cid}" if self.port else None
+
+    def sync_config(self, cfg: dict):
+        snap = {}
+        for g in cfg.get("games", []):
+            for ch in g.get("characters", []):
+                cid = str(ch.get("character_id", ""))
+                if not cid or cid in snap:
+                    continue
+                s = {"name": ch.get("name", ""), "game": g.get("name", ""),
+                     "show_hp_numbers": bool(ch.get("show_hp_numbers", False))}
+                for k in PORTRAIT_KEYS:
+                    s[k] = ch.get(k, "")
+                snap[cid] = s
+        with self._lock:
+            self._chars = snap
+
+    def characters(self) -> list[tuple[str, dict]]:
+        with self._lock:
+            return list(self._chars.items())
+
+    def set_live(self, cid: str, live: bool):
+        with self._lock:
+            if live:
+                self._live.setdefault(cid, {})
+            else:
+                self._live.pop(cid, None)
+
+    def update_hp(self, cid: str, pct, cur: int, mx: int):
+        with self._lock:
+            if cid in self._live:
+                self._live[cid] = {"pct": pct, "cur": cur, "mx": mx}
+
+    def state_for(self, cid: str) -> dict | None:
+        with self._lock:
+            ch = self._chars.get(cid)
+            if ch is None:
+                return None
+            ch   = dict(ch)
+            live = cid in self._live
+            hp   = dict(self._live.get(cid, {}))
+        loaded = "pct" in hp
+        pct    = hp.get("pct") if loaded else None
+        key    = resolve_portrait_key(ch, pct if loaded else 1.0)
+        try:
+            ver = int(os.path.getmtime(ch[key])) if key else 0
+        except OSError:
+            ver = 0
+        return {"name": ch["name"], "live": live, "loaded": loaded,
+                "pct": pct, "cur": hp.get("cur", 0), "mx": hp.get("mx", 0),
+                "state": hp_state(pct), "color": hp_bar_color(pct),
+                "show_hp_numbers": ch["show_hp_numbers"],
+                "portrait": key, "portrait_v": ver}
+
+    def portrait_png(self, cid: str, key: str) -> bytes | None:
+        """Portrait fitted + rounded exactly like the desktop window, at 2x
+        resolution, with a transparent background. Cached per file mtime."""
+        if key not in PORTRAIT_KEYS:
+            return None
+        with self._lock:
+            path = (self._chars.get(cid) or {}).get(key, "")
+        if not path or not os.path.isfile(path):
+            return None
+        cache_key = (path, os.path.getmtime(path))
+        with self._lock:
+            if cache_key in self._img_cache:
+                return self._img_cache[cache_key]
+        size = OVL_W * 2
+        img  = round_image(fit_image(Image.open(path), size, (0, 0, 0, 0)), CORNER_R * 2)
+        buf  = io.BytesIO()
+        img.save(buf, "PNG")
+        data = buf.getvalue()
+        with self._lock:
+            self._img_cache[cache_key] = data
+        return data
+
+OVERLAY_HUB = OverlayHub()
+
+OVERLAY_HTML = r"""<!doctype html>
+<html><head><meta charset="utf-8"><title>HP overlay</title>
+<style>
+  html,body{margin:0;padding:0;background:transparent;overflow:hidden;
+            font-family:"Segoe UI",system-ui,sans-serif}
+  #wrap{width:100vw;box-sizing:border-box;opacity:0;transition:opacity .4s ease}
+  #wrap.show{opacity:1}
+  body.card #wrap{background:#293136;border-radius:5vw}
+  #portrait{display:block;width:100vw;height:100vw;object-fit:contain}
+  #portrait.empty{visibility:hidden}
+  #hp{padding:4.3vw}
+  #track{position:relative;height:11.43vw;border-radius:5.71vw;
+         background:#1e272e;overflow:hidden}
+  #track.unknown{background:repeating-linear-gradient(90deg,#1e272e 0 2vw,#2a3a44 2vw 4.3vw)}
+  #fill{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:5.71vw;
+        transition:width .6s ease,background-color .6s ease}
+  #nums{display:none;margin-top:2.1vw;color:#dce8f0;white-space:pre;
+        font:bold 5.2vw Consolas,"Courier New",monospace;
+        text-shadow:0 0 .6vw #000,0 0 .6vw #000}
+</style></head>
+<body>
+<div id="wrap">
+  <img id="portrait" class="empty" alt="">
+  <div id="hp"><div id="track"><div id="fill"></div></div><div id="nums"></div></div>
+</div>
+<script>
+  const cid    = location.pathname.split("/").filter(Boolean)[1];
+  const params = new URLSearchParams(location.search);
+  if (params.get("card") === "1") document.body.classList.add("card");
+  const always = params.get("always") === "1";
+  const $ = id => document.getElementById(id);
+  let lastSrc = null;
+  async function tick() {
+    try {
+      const r = await fetch(`/api/${cid}`, {cache: "no-store"});
+      if (!r.ok) throw new Error(r.status);
+      const s = await r.json();
+      $("wrap").classList.toggle("show", always || (s.live && s.loaded));
+      const src = s.portrait ? `/portrait/${cid}/${s.portrait}?v=${s.portrait_v}` : "";
+      if (src !== lastSrc) {
+        lastSrc = src;
+        if (src) { $("portrait").src = src; $("portrait").classList.remove("empty"); }
+        else     { $("portrait").removeAttribute("src"); $("portrait").classList.add("empty"); }
+      }
+      if (s.pct === null) {
+        $("track").classList.add("unknown");
+        $("fill").style.width = "0";
+        $("nums").textContent = s.loaded ? "HP not configured" : "";
+      } else {
+        $("track").classList.remove("unknown");
+        $("fill").style.width = (Math.max(0, Math.min(1, s.pct)) * 100) + "%";
+        $("fill").style.backgroundColor = s.color;
+        $("nums").textContent = `${s.cur}  /  ${s.mx}`;
+      }
+      $("nums").style.display = s.show_hp_numbers ? "block" : "none";
+    } catch (e) {
+      if (!always) $("wrap").classList.remove("show");   // app closed
+    }
+    setTimeout(tick, 1000);
+  }
+  tick();
+</script>
+</body></html>
+"""
+
+def _overlay_index_html() -> str:
+    rows = []
+    for cid, ch in sorted(OVERLAY_HUB.characters(),
+                          key=lambda kv: (kv[1]["game"].lower(), kv[1]["name"].lower())):
+        url = OVERLAY_HUB.url_for(cid) or ""
+        rows.append(
+            f'<tr><td>{html.escape(ch["game"])}</td><td>{html.escape(ch["name"])}</td>'
+            f'<td><code>{html.escape(url)}</code></td>'
+            f'<td><button data-url="{html.escape(url)}">Copy</button> '
+            f'<a href="{html.escape(url)}?always=1&card=1" target="_blank">Preview</a></td></tr>')
+    body = "\n".join(rows) or '<tr><td colspan="4">No characters configured yet.</td></tr>'
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>D&amp;D Health Bar overlays</title>
+<style>
+  body{{background:#16202a;color:#dce8f0;font:14px "Segoe UI",system-ui,sans-serif;margin:24px}}
+  h1{{font-size:20px}} p{{color:#82a0b0;max-width:720px}}
+  table{{border-collapse:collapse;margin-top:12px}}
+  td,th{{padding:8px 12px;border-bottom:1px solid #243040;text-align:left}}
+  th{{color:#7ea6b6;font-size:12px;text-transform:uppercase}}
+  code{{color:#60c0d8}} a{{color:#60b0d0}}
+  button{{background:#1a3848;color:#60c0d8;border:1px solid #2a5060;padding:4px 10px;cursor:pointer}}
+</style></head><body>
+<h1>D&amp;D Health Bar — OBS overlays</h1>
+<p>In OBS add a <b>Browser</b> source, paste a URL below, and set the size to
+<b>280 × 340</b> (or any width — the overlay scales). The overlay appears when you
+open the character in the app and fades out when you close it.
+Add <code>?card=1</code> for the dark card background, or <code>?always=1</code> to keep it visible.</p>
+<table><tr><th>Game</th><th>Character</th><th>Overlay URL</th><th></th></tr>
+{body}
+</table>
+<script>
+document.querySelectorAll("button[data-url]").forEach(b => b.onclick = async () => {{
+  await navigator.clipboard.writeText(b.dataset.url);
+  b.textContent = "Copied!"; setTimeout(() => b.textContent = "Copy", 1500);
+}});
+</script></body></html>"""
+
+class _OverlayHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "DnDHealthBar"
+
+    def log_message(self, *args):
+        pass   # keep the console quiet
+
+    def do_GET(self):
+        path = urllib.parse.urlsplit(self.path).path
+        try:
+            if path in ("/", "/index.html"):
+                return self._send(200, "text/html; charset=utf-8",
+                                  _overlay_index_html().encode("utf-8"))
+            if re.fullmatch(r"/overlay/\d+/?", path):
+                return self._send(200, "text/html; charset=utf-8",
+                                  OVERLAY_HTML.encode("utf-8"))
+            m = re.fullmatch(r"/api/(\d+)", path)
+            if m:
+                st = OVERLAY_HUB.state_for(m.group(1))
+                if st is None:
+                    return self._send(404, "application/json", b'{"error":"unknown character"}')
+                return self._send(200, "application/json", json.dumps(st).encode("utf-8"))
+            m = re.fullmatch(r"/portrait/(\d+)/(portrait_[a-z]+)", path)
+            if m:
+                data = OVERLAY_HUB.portrait_png(m.group(1), m.group(2))
+                if data is None:
+                    return self._send(404, "text/plain", b"Not found")
+                return self._send(200, "image/png", data, cache=True)
+            self._send(404, "text/plain", b"Not found")
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception:
+            traceback.print_exc()
+            try: self._send(500, "text/plain", b"Internal error")
+            except Exception: pass
+
+    def _send(self, code: int, ctype: str, body: bytes, cache: bool = False):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "max-age=86400" if cache else "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+def start_overlay_server(port: int) -> int | None:
+    """Start the overlay HTTP server on 127.0.0.1. Tries `port` and the next
+    9 ports if it is taken. Returns the port in use, or None."""
+    for p in range(port, port + 10):
+        try:
+            srv = http.server.ThreadingHTTPServer(("127.0.0.1", p), _OverlayHandler)
+        except OSError:
+            continue
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        OVERLAY_HUB.port = p
+        return p
+    print(f"Warning: could not start overlay server on ports {port}-{port+9}")
+    return None
+
+# ---------------------------------------------------------------------------
+# Window position helpers
+# ---------------------------------------------------------------------------
+def _virtual_screen(widget) -> tuple[int, int, int, int]:
+    """(x, y, w, h) of the whole desktop across all monitors."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            gsm = ctypes.windll.user32.GetSystemMetrics
+            return gsm(76), gsm(77), gsm(78), gsm(79)
+        except Exception:
+            pass
+    return 0, 0, widget.winfo_screenwidth(), widget.winfo_screenheight()
+
+def position_on_screen(widget, x: int, y: int) -> bool:
+    vx, vy, vw, vh = _virtual_screen(widget)
+    return vx - OVL_W + 60 <= x <= vx + vw - 60 and vy <= y <= vy + vh - 60
 
 def mk_sep(parent, color=MGR_BORDER, pad=0):
     tk.Frame(parent, bg=color, height=1).pack(fill="x", padx=pad)
@@ -305,14 +672,15 @@ class ToggleSwitch(tk.Canvas):
 # HP overlay window
 # ---------------------------------------------------------------------------
 class CharacterWindow:
-    def __init__(self, master, char: dict, on_closed=None, on_hp_update=None):
+    def __init__(self, master, char: dict, on_closed=None, on_hp_update=None,
+                 status_cb=None):
         self.char         = char
         self.on_closed    = on_closed
         self.on_hp_update = on_hp_update
         self._stop        = threading.Event()
         self._photo       = None
         self._last_state  = None
-        self._status_cb   = None
+        self._status_cb   = status_cb   # set before the worker thread starts
 
         self.win = tk.Toplevel(master)
         self.win.title(char.get("name","HP"))
@@ -323,10 +691,21 @@ class CharacterWindow:
         self.win.attributes("-alpha", opacity)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
+        # Restore last position (ignored if that monitor is gone)
+        pos = char.get("window_pos")
+        if (isinstance(pos, list) and len(pos) == 2
+                and all(isinstance(v, int) for v in pos)
+                and position_on_screen(self.win, *pos)):
+            self.win.geometry(f"+{pos[0]}+{pos[1]}")
+
         self._build_ui()
         self._load_portrait(self._resolve_portrait(1.0))
         self._apply_hp_visibility()
         threading.Thread(target=self._run_loop, daemon=True).start()
+
+    def set_title(self, name: str):
+        """Window title doubles as the OBS window-capture match key."""
+        self.win.title(name or "HP")
 
     def _build_ui(self):
         self.portrait_canvas = tk.Canvas(self.win, width=OVL_W, height=OVL_W,
@@ -353,40 +732,9 @@ class CharacterWindow:
     def refresh_visibility(self):
         self.win.after(0, self._apply_hp_visibility)
 
-    _STATE_ORDER = ["portrait_unscathed","portrait_scratched","portrait_injured",
-                    "portrait_bloodied","portrait_critical","portrait_dead"]
-    _STATE_MAP   = {"full":"portrait_unscathed","scratched":"portrait_scratched",
-                    "injured":"portrait_injured","bloodied":"portrait_bloodied",
-                    "critical":"portrait_critical","dead":"portrait_dead"}
-
-    def _resolve_portrait(self, pct: float) -> str:
-        """Find the best available portrait for the current HP state.
-
-        Starts at the ideal state and walks outward in both directions,
-        alternating closer-healthier then closer-worse, so the nearest
-        portrait is always preferred over a distant one.
-
-        Example for bloodied (idx=3), walk order:
-            bloodied(3) → injured(2) → critical(4) → scratched(1) → dead(5) → unscathed(0)
-        """
-        ideal = self._STATE_MAP[hp_state(pct)]
-        idx   = self._STATE_ORDER.index(ideal)
-        n     = len(self._STATE_ORDER)
-
-        # Build search order: ideal first, then alternate outward
-        order = [idx]
-        for offset in range(1, n):
-            if idx - offset >= 0:
-                order.append(idx - offset)   # healthier neighbour
-            if idx + offset < n:
-                order.append(idx + offset)   # worse neighbour
-
-        for i in order:
-            key = self._STATE_ORDER[i]
-            p   = self.char.get(key, "")
-            if p and os.path.isfile(p):
-                return p
-        return ""
+    def _resolve_portrait(self, pct) -> str:
+        key = resolve_portrait_key(self.char, pct)
+        return self.char.get(key, "") if key else ""
 
     def _update_portrait_for(self, pct: float):
         state = hp_state(pct)
@@ -427,7 +775,9 @@ class CharacterWindow:
             c.create_rectangle(r,0,fw,h,                        fill=col,outline="")
 
     def _update_ui(self, pct, cur, mx):
+        """Called from the worker thread — marshals onto the Tk main thread."""
         def _do():
+            if self._stop.is_set(): return
             self._draw_bar(pct)
             self._update_portrait_for(pct)
             if pct is None:
@@ -436,7 +786,7 @@ class CharacterWindow:
                 self.hp_label.config(text=f"{cur}  /  {mx}")
             if self.on_hp_update:
                 self.on_hp_update(self.char["character_id"], pct, cur, mx)
-        self.win.after(0, _do)
+        run_on_ui(_do)
 
     def _set_status(self, key: str):
         msgs = {"init":"Connecting…","fetch":"Fetching HP…",
@@ -450,11 +800,10 @@ class CharacterWindow:
         if self._status_cb:
             self._status_cb(self.char["character_id"], f"⚠ {msg}")
         def _do():
-            try:
-                self._draw_bar(None)
-                self.hp_label.config(text=f"⚠ {msg}")
-            except tk.TclError: pass
-        self.win.after(0, _do)
+            if self._stop.is_set(): return
+            self._draw_bar(None)
+            self.hp_label.config(text=f"⚠ {msg}")
+        run_on_ui(_do)
 
     def _run_loop(self):
         char_id          = self.char["character_id"]
@@ -483,7 +832,8 @@ class CharacterWindow:
                     self._update_ui(pct, cur, mx)
 
             except requests.exceptions.HTTPError as e:
-                code = e.response.status_code if e.response else 0
+                # NB: a Response is falsy for 4xx/5xx, so test against None
+                code = e.response.status_code if e.response is not None else 0
                 if code in (401, 403):
                     # Session cookie expired — recreate silently
                     print(f"[{char_id}] session expired ({code}), refreshing…")
@@ -517,6 +867,13 @@ class CharacterWindow:
     def close(self):
         if self._stop.is_set(): return
         self._stop.set()
+        # Remember where the window was so it reopens in the same spot
+        try:
+            m = re.search(r"\+(-?\d+)\+(-?\d+)$", self.win.geometry())
+            if m:
+                self.char["window_pos"] = [int(m.group(1)), int(m.group(2))]
+        except tk.TclError:
+            pass
         try: self.win.destroy()
         except: pass
         if self.on_closed: self.on_closed()
@@ -578,6 +935,7 @@ class CharacterDialog(tk.Toplevel):
         self._test_label = tk.Label(body, text="", bg=DLG_BG, fg=T_DIM, font=F_TINY)
         self._test_label.pack(anchor="w", pady=(4,0))
         self._test_after_id = None   # debounce handle
+        self._test_seq      = 0      # ignore results from superseded tests
 
         mk_sep(body, MGR_BORDER, 0)
         tk.Label(body, text="PORTRAITS BY HEALTH STATE", bg=DLG_BG, fg=DLG_LABEL_FG,
@@ -680,6 +1038,8 @@ class CharacterDialog(tk.Toplevel):
             self._test_label.config(text="⚠ Enter a valid character ID or URL.", fg=HP_INJURED)
             return
         self._test_label.config(text="Testing…", fg=T_DIM)
+        self._test_seq += 1
+        seq = self._test_seq
 
         def _work():
             try:
@@ -689,7 +1049,7 @@ class CharacterDialog(tk.Toplevel):
                 api_name = data.get("api_name", "")
                 return ("ok", cur, mx, api_name)
             except requests.exceptions.HTTPError as e:
-                code = e.response.status_code if e.response else "?"
+                code = e.response.status_code if e.response is not None else "?"
                 if code == 404:        return ("not_found",  None, None, None)
                 if code in (401, 403): return ("private",    None, None, None)
                 return ("http_error", code, None, None)
@@ -697,6 +1057,8 @@ class CharacterDialog(tk.Toplevel):
                 return ("error", str(e), None, None)
 
         def _done(result):
+            if seq != self._test_seq or not self.winfo_exists():
+                return   # a newer test superseded this one, or dialog closed
             if result[0] == "ok":
                 cur, mx, api_name = result[1], result[2], result[3]
                 hp_text = f"{cur} / {mx}" if cur is not None else "not configured"
@@ -716,8 +1078,10 @@ class CharacterDialog(tk.Toplevel):
             else:
                 self._test_label.config(text="✗ Connection failed.", fg=HP_CRIT)
 
-        threading.Thread(target=lambda: self.after(0, lambda: _done(_work())),
-                         daemon=True).start()
+        def _thread():
+            result = _work()                       # network I/O off the UI thread
+            run_on_ui(lambda: _done(result))
+        threading.Thread(target=_thread, daemon=True).start()
 
     def _browse(self, var):
         path = filedialog.askopenfilename(
@@ -818,6 +1182,12 @@ class ManagerWindow:
                  bg=MGR_HEADER, fg=T_PRIMARY, font=F_TITLE).pack(anchor="w")
         tk.Label(tcol, text=f"v{APP_VERSION}  ·  public characters only  ·  no credentials required",
                  bg=MGR_HEADER, fg=T_DIM, font=F_TINY).pack(anchor="w")
+        if OVERLAY_HUB.port:
+            obs_lbl = tk.Label(hdr, text="OBS overlays ↗", bg=MGR_HEADER, fg=BTN_OPEN_FG,
+                               font=F_TINY, cursor="hand2")
+            obs_lbl.pack(side="right", padx=12)
+            obs_lbl.bind("<Button-1>", lambda _e: webbrowser.open(
+                f"http://127.0.0.1:{OVERLAY_HUB.port}/"))
         mk_sep(self.root, MGR_BORDER)
 
         gbar = tk.Frame(self.root, bg=MGR_HEADER, pady=7)
@@ -1217,6 +1587,10 @@ class ManagerWindow:
         open_btn.pack(side="left", padx=(0,3), ipady=4)
         self._row_widgets[cid]["open_btn"] = open_btn
 
+        styled_button(btns,"OBS",BTN_EDIT_BG,BTN_EDIT_FG,BTN_EDIT_BD,
+                      lambda c=ch: self._copy_overlay_url(c),
+                      font=F_TINY).pack(side="left",padx=(0,3),ipady=4,ipadx=2)
+
         styled_button(btns,"✎",BTN_EDIT_BG,BTN_EDIT_FG,BTN_EDIT_BD,
                       lambda c=ch,g=game: self._edit_character(c,g),width=3).pack(side="left",padx=(0,3),ipady=4)
         styled_button(btns,"✕",DANGER_BG,DANGER_FG,DANGER_BD,
@@ -1265,9 +1639,10 @@ class ManagerWindow:
         cid=ch["character_id"]
         win=CharacterWindow(master=self.root, char=ch,
                             on_closed=lambda c=cid: self._on_window_closed(c),
-                            on_hp_update=self._on_hp_update)
-        win._status_cb=self._on_status_update
+                            on_hp_update=self._on_hp_update,
+                            status_cb=self._on_status_update)
         self._windows[cid]=win
+        OVERLAY_HUB.set_live(cid, True)
 
     def _close_window(self, cid):
         if cid in self._windows:
@@ -1280,6 +1655,7 @@ class ManagerWindow:
         self._update_status_bar()
 
     def _on_window_closed(self, cid):
+        OVERLAY_HUB.set_live(cid, False)
         self._windows.pop(cid,None)
         self._hp_data.pop(cid,None)
         self._status.pop(cid,None)
@@ -1304,8 +1680,9 @@ class ManagerWindow:
                 except tk.TclError:
                     pass
             # Reorder existing row widgets in place — no destroy/rebuild
-            if self._sort_mode == "hp" or self._live_on_top:
+            if self._sort_mode in ("hp_asc", "hp_desc") or self._live_on_top:
                 self._reorder_rows()
+        OVERLAY_HUB.update_hp(cid, pct, cur, mx)
         self.root.after(0, _do)
 
     def _reorder_rows(self):
@@ -1330,23 +1707,38 @@ class ManagerWindow:
             if w:
                 try:
                     w["row"].pack_forget()
-                    w["row"].pack(fill="x", pady=3)
+                    w["row"].pack(fill="x", pady=5)   # must match _make_char_row
                 except tk.TclError:
                     pass
 
     def _on_status_update(self, cid, msg):
-        self._status[cid] = msg
+        """Called from worker threads."""
         def _do():
+            if cid not in self._windows: return   # window closed meanwhile
+            self._status[cid] = msg
             w = self._row_widgets.get(cid)
-            if not w: return
-            try:
-                dot_col = HP_FULL if "Polling" in msg else \
-                          HP_CRIT if "Error"   in msg else "#2a3c4a"
-                w["dot"].itemconfig(w["dot_oval"], fill=dot_col)
-            except tk.TclError:
-                pass
+            if w:
+                try:
+                    dot_col = HP_FULL if "Polling" in msg else \
+                              HP_CRIT if ("Error" in msg or "⚠" in msg) else "#2a3c4a"
+                    w["dot"].itemconfig(w["dot_oval"], fill=dot_col)
+                except tk.TclError:
+                    pass
             self._update_status_bar()
-        self.root.after(0, _do)
+        run_on_ui(_do)
+
+    def _copy_overlay_url(self, ch):
+        url = OVERLAY_HUB.url_for(ch["character_id"])
+        if not url:
+            messagebox.showwarning("OBS overlay",
+                "The overlay server is not running (port in use or disabled in the config).",
+                parent=self.root)
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+        self._status_label.config(
+            text=f"Copied OBS browser-source URL for {ch.get('name','?')}: {url}", fg=BTN_OPEN_FG)
+        self.root.after(4000, self._update_status_bar)
 
     def _update_status_bar(self):
         if not self._windows:
@@ -1398,14 +1790,25 @@ class ManagerWindow:
             self._refresh_chars()
 
     def _edit_character(self, ch, game):
+        old_cid=ch["character_id"]
         dlg=CharacterDialog(self.root,ch.copy())
         self.root.wait_window(dlg)
         if not dlg.result: return
         ch.update(dlg.result)
         save_config(self.cfg)
         cid=ch["character_id"]
-        if cid in self._windows:
-            self._windows[cid]._last_state=None
+        if old_cid in self._windows:
+            if cid != old_cid:
+                # Different character — restart the poller under the new ID
+                self._close_window(old_cid)
+                self._open_window(ch)
+            else:
+                w=self._windows[cid]
+                w.set_title(ch.get("name",""))
+                w.win.attributes("-topmost", bool(ch.get("always_on_top", False)))
+                w.win.attributes("-alpha", max(0.2, min(1.0, float(ch.get("opacity", 1.0)))))
+                w._last_state=None
+                w._load_portrait(w._resolve_portrait(self._hp_data.get(cid,(1.0,))[0]))
         self._refresh_chars()
 
     def _delete_character(self, ch, game):
@@ -1419,58 +1822,67 @@ class ManagerWindow:
     def _on_quit(self):
         save_config(self.cfg)
         for cid in list(self._windows): self._close_window(cid)
-        if hasattr(self, "_tray") and self._tray:
-            try: self._tray.stop()
-            except: pass
+        self._stop_tray()
         self.root.destroy()
 
     # ── System tray ──────────────────────────────────────────────────────────
-    def _setup_tray(self):
-        if not HAS_TRAY:
-            # Fallback: just minimize normally
-            self.root.protocol("WM_DELETE_WINDOW", self._minimize_to_taskbar)
-            return
+    _tray = None
 
-        # Create a simple coloured icon for the tray
+    def _setup_tray(self):
+        # Without pystray, closing the manager simply quits (set in __init__).
+        if HAS_TRAY:
+            self.root.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
+
+    def _make_tray_icon(self):
         icon_img = Image.new("RGBA", (64, 64), "#293136")
         draw     = ImageDraw.Draw(icon_img)
         draw.ellipse([8,8,56,56], fill=HP_FULL)
         draw.ellipse([18,18,46,46], fill="#293136")
-
         menu = pystray.Menu(
             TrayItem("Show", self._restore_from_tray, default=True),
             TrayItem("Quit", self._quit_from_tray),
         )
-        self._tray = pystray.Icon("DnD Health Bar", icon_img,
-                                   "D&D Health Bar", menu)
-        # Minimize to tray instead of closing
-        self.root.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
+        return pystray.Icon("DnD Health Bar", icon_img, "D&D Health Bar", menu)
 
     def _minimize_to_tray(self):
         self.root.withdraw()
+        # A stopped pystray Icon can't be run again, so build a fresh one each time
+        self._stop_tray()
+        self._tray = self._make_tray_icon()
         threading.Thread(target=self._tray.run, daemon=True).start()
 
-    def _minimize_to_taskbar(self):
-        self.root.iconify()
+    def _stop_tray(self):
+        tray, self._tray = self._tray, None
+        if tray:
+            try: tray.stop()
+            except Exception: pass
 
+    # Tray menu callbacks run on pystray's thread
     def _restore_from_tray(self, icon=None, item=None):
-        try: self._tray.stop()
-        except: pass
-        self.root.after(0, self.root.deiconify)
+        self._stop_tray()
+        run_on_ui(self.root.deiconify)
 
     def _quit_from_tray(self, icon=None, item=None):
-        try: self._tray.stop()
-        except: pass
-        self.root.after(0, self._on_quit)
+        self._stop_tray()
+        run_on_ui(self._on_quit)
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
     cfg  = load_config()
+    OVERLAY_HUB.sync_config(cfg)
+    srv  = cfg.setdefault("overlay_server", {"enabled": True, "port": DEFAULT_OVERLAY_PORT})
+    if srv.get("enabled", True):
+        try:
+            port = int(srv.get("port", DEFAULT_OVERLAY_PORT))
+        except (TypeError, ValueError):
+            port = DEFAULT_OVERLAY_PORT
+        start_overlay_server(port)
     root = tk.Tk()
     app  = ManagerWindow(root, cfg)
     app._setup_tray()
+    root.after(50, _pump_ui_queue, root)
     root.mainloop()
 
 if __name__ == "__main__":
