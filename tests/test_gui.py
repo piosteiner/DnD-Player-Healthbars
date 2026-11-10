@@ -11,10 +11,17 @@ tk = pytest.importorskip("tkinter")
 
 @pytest.fixture
 def root():
-    try:
-        r = tk.Tk()
-    except tk.TclError:
-        pytest.skip("no display")
+    # Creating a new Tk root right after destroying the previous one
+    # occasionally fails on Windows — retry briefly before giving up.
+    for attempt in range(5):
+        try:
+            r = tk.Tk()
+            break
+        except tk.TclError as e:
+            err = e
+            time.sleep(0.3)
+    else:
+        pytest.skip(f"no display ({err})")
     r.withdraw()
     yield r
     try:

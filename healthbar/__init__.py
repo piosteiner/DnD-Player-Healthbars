@@ -13,5 +13,5 @@ Modules
 """
 
 APP_NAME    = "D&D Health Bar"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.3.1"
 GITHUB_REPO = "piosteiner/DnD-Player-Healthbars"

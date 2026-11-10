@@ -41,7 +41,8 @@ def get_autostart(name: str = APP_NAME) -> bool:
 
 def set_autostart(enabled: bool, name: str = APP_NAME, command: str | None = None):
     import winreg
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+    # CreateKeyEx also opens the key if it exists (fresh profiles may lack it)
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
         if enabled:
             winreg.SetValueEx(k, name, 0, winreg.REG_SZ, command or autostart_command())
         else:

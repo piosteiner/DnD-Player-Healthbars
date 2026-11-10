@@ -1,6 +1,12 @@
 # Changelog
 
-## 2.3.0
+## 2.3.1
+
+First release of the 2.3 line (the 2.3.0 build stopped at a failing test and
+was never published). Includes everything below plus:
+
+- Fix: "Start with Windows" now works on profiles where Windows' autostart
+  registry key doesn't exist yet.
 
 **New**
 - **Manual characters** for NPCs, monsters and companions that aren't on
