@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.3.0
+
+**New**
+- **Manual characters** for NPCs, monsters and companions that aren't on
+  D&D Beyond: set max HP, then damage / heal from the app (click the HP badge,
+  or mouse wheel ±1). Damage uses temporary HP first. They show on stream like
+  everyone else.
+- **One-click update**: "Update now" downloads the new version (checked
+  against GitHub's checksum), replaces the program and restarts.
+- **Start with Windows** (minimised) — in ⚙ Settings.
+- **Colour-blind friendly colours** (blue → yellow → orange → magenta) for the
+  app and the overlays — in ⚙ Settings, or `?palette=cb` per overlay.
+- New overlay options: **`style=bar`** (compact bars with names, no portraits —
+  great for big parties) and **`name=1`** (name under the portrait).
+- **Copy diagnostics** (⋯ menu) collects what D&D Beyond reports for a
+  character, for troubleshooting.
+- The app remembers the **last selected game**.
+- New app icon; the .exe now carries proper version information.
+
+**Changed**
+- **0 HP is no longer "dead"**: a character at 0 HP is *dying* (Critical
+  portrait, pulsing red glow, death saves) or *stable*, and only *dead* after
+  three failed death saves. Manual NPCs die at 0 HP.
+- All live characters are checked by **one shared connection** — fewer
+  requests to D&D Beyond with a full party.
+- The .exe is no longer UPX-compressed, which makes antivirus false alarms
+  less likely.
+
+**Under the hood**
+- The code is split into modules (`healthbar/` package); 40 automated tests,
+  including an end-to-end check of the self-update.
+
 ## 2.2.0
 
 **OBS**

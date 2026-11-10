@@ -89,31 +89,31 @@ def obs():
     return mock, {"host": "127.0.0.1", "port": port, "password": PASSWORD, "scene": ""}
 
 
-def test_connection_errors_are_explained(app, obs):
+def test_connection_errors_are_explained(hb, obs):
     _, cfg = obs
     for bad, expect in [({**cfg, "password": "nope"}, "password is wrong"),
                         ({**cfg, "password": ""}, "asks for a WebSocket password"),
                         ({**cfg, "port": free_port()}, "Can't reach OBS")]:
-        with pytest.raises(app.OBSError, match=expect):
-            app.obs_list_scenes(bad)
-    assert app.obs_list_scenes(cfg) == ["Combat", "Exploration"]
+        with pytest.raises(hb.obs.OBSError, match=expect):
+            hb.obs.list_scenes(bad)
+    assert hb.obs.list_scenes(cfg) == ["Combat", "Exploration"]
 
 
-def test_add_update_and_party(app, obs):
+def test_add_update_and_party(hb, obs):
     mock, cfg = obs
-    app.OVERLAY_HUB.port = 7777
+    hb.overlay.HUB.port = 7777
     game = {"id": "abcd1234", "name": "Camp", "characters": [
         {"name": "Abu", "character_id": "1"},
         {"name": "Ally", "character_id": "2", "show_hp_numbers": True}]}
-    items = [app.character_obs_item(c, i) for i, c in enumerate(game["characters"])]
-    assert app.obs_add_overlays(cfg, items) == ("Combat", 2, 0)
-    assert mock.inputs["HP Overlay - Ally"]["settings"]["height"] == app.CARD_H_NUM
+    items = [hb.obs.character_item(c, i) for i, c in enumerate(game["characters"])]
+    assert hb.obs.add_overlays(cfg, items) == ("Combat", 2, 0)
+    assert mock.inputs["HP Overlay - Ally"]["settings"]["height"] == hb.theme.CARD_H_NUM
     assert mock.transforms[("Combat", 3)]["positionX"] == 320          # side by side
-    assert app.obs_add_overlays(cfg, items) == ("Combat", 0, 2)        # no duplicates
+    assert hb.obs.add_overlays(cfg, items) == ("Combat", 0, 2)        # no duplicates
     assert mock.items["Combat"].count("HP Overlay - Abu") == 1
-    assert app.obs_add_overlays({**cfg, "scene": "Exploration"}, items) == ("Exploration", 0, 2)
+    assert hb.obs.add_overlays({**cfg, "scene": "Exploration"}, items) == ("Exploration", 0, 2)
 
-    party = app.party_obs_item(game)
+    party = hb.obs.party_item(game)
     assert party["url"].endswith("/party/abcd1234") and party["width"] == 2 * 280 + 16
-    app.obs_add_overlays(cfg, [party])
+    hb.obs.add_overlays(cfg, [party])
     assert "HP Party - Camp" in mock.items["Combat"]

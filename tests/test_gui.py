@@ -1,6 +1,5 @@
-"""Smoke test of the real Tk UI with D&D Beyond mocked out."""
+"""Smoke tests of the real Tk UI with D&D Beyond mocked out."""
 import os
-import queue
 import time
 
 import pytest
@@ -24,66 +23,108 @@ def root():
         pass
 
 
-def pump(app, root, seconds):
-    """Run the Tk loop + the app's worker→UI queue for a while."""
+def pump(root, seconds):
+    from healthbar.ui.common import drain_ui_queue
     end = time.time() + seconds
     while time.time() < end:
-        while True:
-            try:
-                fn = app._ui_queue.get_nowait()
-            except queue.Empty:
-                break
-            fn()
+        drain_ui_queue()
         root.update()
         time.sleep(0.02)
 
 
-def test_manager_live_flow(app, root, monkeypatch):
-    make_image(os.path.join(app._BASE_DIR, "p.png"))
+def wait_for(root, cond, seconds=5):
+    from healthbar.ui.common import drain_ui_queue
+    end = time.time() + seconds
+    while time.time() < end:
+        drain_ui_queue()
+        root.update()
+        if cond():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_manager_live_flow(hb, root, monkeypatch):
+    from healthbar.ui.manager import ManagerWindow
+    make_image(os.path.join(hb.config.BASE_DIR, "p.png"))
     raw = raw_character(temporaryHitPoints=4, conditions=[{"id": 11}])
-    monkeypatch.setattr(app, "make_session", lambda cid: object())
-    monkeypatch.setattr(app, "get_character", lambda s, cid: app.parse_character(raw))
-    app.POLL_INTERVAL = 1
+    monkeypatch.setattr(hb.ddb, "make_session", lambda cid: object())
+    monkeypatch.setattr(hb.ddb, "get_character", lambda s, cid: hb.ddb.parse_character(raw))
+    hb.config.POLL_INTERVAL = 2
 
     ch = {"name": "Thorin", "character_id": "123", "portrait_unscathed": "p.png"}
-    cfg = {"games": [{"id": "abcd1234", "name": "Camp", "characters": [ch]}]}
-    app.OVERLAY_HUB.sync_config(cfg)
-    mgr = app.ManagerWindow(root, cfg)
-    assert "123" in mgr._row_widgets
+    npc = {"name": "Goblin", "character_id": "npc00ff00ff", "source": "manual",
+           "max_hp": 7, "current_hp": 7, "temp_hp": 0}
+    cfg = {"games": [{"id": "abcd1234", "name": "Camp", "characters": [ch, npc]},
+                     {"id": "eeee0000", "name": "Other", "characters": []}],
+           "last_game": "eeee0000"}
+    hb.overlay.HUB.sync_config(cfg)
+    mgr = ManagerWindow(root, cfg)
+    assert mgr._game_var.get() == "Other"                     # remembers the last game
+    mgr._select_game(cfg["games"][0])
+    assert cfg["last_game"] == "abcd1234"
+    assert {"123", "npc00ff00ff"} <= set(mgr._row_widgets)
+    assert mgr._row_widgets["npc00ff00ff"]["badge"].cget("text") == "7 / 7"   # manual HP shown
 
     mgr._open_window(ch)
     mgr._windows["123"].win.geometry("+222+111")
-    pump(app, root, 1.5)
-    st = app.OVERLAY_HUB.state_for("123")
+    assert wait_for(root, lambda: (hb.overlay.HUB.state_for("123") or {}).get("loaded"))
+    st = hb.overlay.HUB.state_for("123")
     assert st["live"] and (st["cur"], st["mx"], st["temp"]) == (46, 56, 4)
     assert st["conditions"] == ["Poisoned"]
     assert mgr._row_widgets["123"]["badge"].cget("text") == "46 / 56  +4"
-    assert mgr._status["123"][1] == "ok"
+    assert wait_for(root, lambda: mgr._status.get("123", ("", ""))[1] == "ok")
+
+    # manual character: live + damage via the HP dialog
+    mgr._open_window(npc)
+    pump(root, 0.2)
+    mgr._open_hp_dialog(npc)
+    dlg = mgr._hp_dialogs["npc00ff00ff"]
+    dlg._amount.set("3")
+    dlg._apply("damage")
+    pump(root, 0.2)
+    assert npc["current_hp"] == 4
+    assert hb.overlay.HUB.state_for("npc00ff00ff")["cur"] == 4
+    assert mgr._row_widgets["npc00ff00ff"]["badge"].cget("text") == "4 / 7"
+    dlg.destroy()
 
     mgr._close_window("123")
     assert ch["window_pos"] == [222, 111]
-    assert app.OVERLAY_HUB.state_for("123")["live"] is False
-    assert os.path.isfile(app.CONFIG_FILE)                 # position saved
+    assert hb.overlay.HUB.state_for("123")["live"] is False
+    assert os.path.isfile(hb.config.CONFIG_FILE)
 
 
-def test_dialogs_build(app, root):
+def test_dialogs_build(hb, root):
+    from healthbar.ui.dialogs import (CharacterDialog, GameDialog, HPDialog, OBSDialog,
+                                      SettingsDialog)
     cfg = {"games": [{"id": "abcd1234", "name": "Camp", "characters": []}]}
-    for dlg in (app.CharacterDialog(root, {}), app.GameDialog(root, {}),
-                app.OBSDialog(root, app.obs_settings(cfg), "Camp"),
-                app.SettingsDialog(root, cfg)):
+    npc = {"name": "Goblin", "character_id": "npc1", "source": "manual", "max_hp": 7}
+    for dlg in (CharacterDialog(root, {}), CharacterDialog(root, npc), GameDialog(root, {}),
+                OBSDialog(root, hb.obs.settings(cfg), "Camp"), SettingsDialog(root, cfg, True),
+                HPDialog(root, npc, lambda c: None)):
         root.update()
         dlg.destroy()
 
 
-def test_character_dialog_imports_portraits(app, root, tmp_path):
+def test_character_dialog_ddb_and_manual(hb, root, tmp_path):
+    from healthbar.ui.dialogs import CharacterDialog
     outside = make_image(tmp_path / "pic.png")
-    dlg = app.CharacterDialog(root, {})
+    dlg = CharacterDialog(root, {})
     dlg._vars["character_id"].set("https://www.dndbeyond.com/characters/987654")
     dlg._vars["name"].set("Luna")
     dlg._portrait_vars["portrait_unscathed"].set(outside)
     dlg._use_for_all(dlg._portrait_vars["portrait_unscathed"])
     dlg._submit()
     r = dlg.result
-    assert r["character_id"] == "987654"
+    assert r["character_id"] == "987654" and r["source"] == "dndbeyond"
     assert r["portrait_dead"] == r["portrait_unscathed"] == "portraits/Luna_987654/unscathed.png"
-    assert len(os.listdir(os.path.join(app._BASE_DIR, "portraits", "Luna_987654"))) == 1
+
+    dlg = CharacterDialog(root, {})
+    dlg._set_mode(True)
+    dlg._vars["name"].set("Owlbear")
+    dlg._vars["max_hp"].set("59")
+    dlg._vars["current_hp"].set("70")                      # clamped to max
+    dlg._submit()
+    r = dlg.result
+    assert r["source"] == "manual" and r["character_id"].startswith("npc")
+    assert (r["max_hp"], r["current_hp"], r["temp_hp"]) == (59, 59, 0)

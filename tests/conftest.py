@@ -1,26 +1,30 @@
-import importlib.util
 import socket
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-
-def load_app(base_dir):
-    """Fresh copy of the app module pointed at an empty data folder."""
-    spec = importlib.util.spec_from_file_location("dnd_app", ROOT / "dnd_healthbar_public.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    mod.set_base_dir(str(base_dir))
-    return mod
+from healthbar import config, ddb, obs, overlay, system, theme, updater  # noqa: E402
 
 
 @pytest.fixture
-def app(tmp_path):
+def hb(tmp_path):
+    """The app's modules with fresh state and an empty data folder."""
     data = tmp_path / "data"
     data.mkdir()
-    return load_app(data)
+    config.set_base_dir(str(data))
+    config.SAVE_ERROR_HANDLER = None
+    config.POLL_INTERVAL = config.DEFAULT_POLL_INTERVAL
+    theme.set_palette("default")
+    overlay.HUB.reset()
+    ddb.POLLER.reset()
+    yield SimpleNamespace(config=config, ddb=ddb, obs=obs, overlay=overlay, system=system,
+                          theme=theme, updater=updater, data=data)
+    ddb.POLLER.reset()
 
 
 def free_port() -> int:
@@ -30,12 +34,13 @@ def free_port() -> int:
 
 
 def raw_character(**over):
-    """Minimal D&D Beyond character payload."""
+    """Minimal D&D Beyond character payload (max HP 56 with these stats)."""
     d = {
         "name": "Testy", "baseHitPoints": 40, "bonusHitPoints": 0, "overrideHitPoints": None,
         "removedHitPoints": 10, "temporaryHitPoints": 0,
-        "classes": [{"level": 5, "classFeatures": [{"definition": {"id": 111}}]},
-                    {"level": 3, "classFeatures": []}],
+        "classes": [{"level": 5, "classFeatures": [{"definition": {"id": 111}}],
+                     "definition": {"name": "Sorcerer"}},
+                    {"level": 3, "classFeatures": [], "definition": {"name": "Fighter"}}],
         "stats": [{"id": 3, "value": 14}], "bonusStats": [], "overrideStats": [],
         "modifiers": {},
         "decorations": {"avatarUrl": "https://www.dndbeyond.com/avatars/1/2/3.png"},
