@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest
+websockets         # mock OBS server in tests
+pyinstaller

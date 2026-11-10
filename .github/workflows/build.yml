@@ -4,41 +4,58 @@ on:
   push:
     tags:
       - 'v*'
+  pull_request:
+  workflow_dispatch:
 
 jobs:
-  build-windows:
-    name: Windows (.exe)
+  test:
+    name: Tests
     runs-on: windows-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install pyinstaller requests Pillow pystray websocket-client
+        run: pip install -r requirements-dev.txt
 
-      - name: Build public edition
+      - name: Run tests
+        run: python -m pytest tests -q
+
+  build-windows:
+    name: Windows (.exe)
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pyinstaller -r requirements.txt
+
+      - name: Build
         run: pyinstaller dnd_healthbar_public.spec --clean --noconfirm
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-exe
           path: dist/DnD_HealthBar_Public.exe
 
   build-linux:
     name: Linux (binary)
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -48,13 +65,12 @@ jobs:
           sudo apt-get install -y python3-tk libappindicator3-dev gir1.2-appindicator3-0.1
 
       - name: Install Python dependencies
-        run: pip install pyinstaller requests Pillow pystray websocket-client
+        run: pip install pyinstaller -r requirements.txt
 
-      - name: Build public edition
+      - name: Build
         run: pyinstaller dnd_healthbar_public.spec --clean --noconfirm
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-binary
           path: dist/DnD_HealthBar_Public
@@ -66,14 +82,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
         with:
           name: windows-exe
           path: release/
 
-      - name: Download Linux artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: linux-binary
           path: release/
@@ -81,28 +97,18 @@ jobs:
       - name: Make Linux binary executable
         run: chmod +x release/DnD_HealthBar_Public
 
-      - name: Extract version from tag
-        id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Release notes from CHANGELOG.md
+        run: |
+          python3 .github/scripts/release_notes.py "$GITHUB_REF_NAME" > notes.md
+          cat notes.md
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
-          name: D&D Health Bar ${{ steps.version.outputs.VERSION }}
-          body: |
-            ## D&D Health Bar ${{ steps.version.outputs.VERSION }} — Public Edition
-
-            No login required. Works with public D&D Beyond character sheets only.
-
-            | OS      | File                          |
-            |---------|-------------------------------|
-            | Windows | `DnD_HealthBar_Public.exe`    |
-            | Linux   | `DnD_HealthBar_Public`        |
-
-            **First time?** Just download and run — no Python needed.
-            **Updating?** Replace your old binary. Your config file is never affected.
+          name: D&D Health Bar ${{ github.ref_name }}
+          body_path: notes.md
           files: |
             release/DnD_HealthBar_Public.exe
             release/DnD_HealthBar_Public
+          fail_on_unmatched_files: true
           draft: false
           prerelease: false

@@ -1,0 +1,4 @@
+requests
+Pillow
+websocket-client   # OBS integration
+pystray            # optional: hide to system tray

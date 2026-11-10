@@ -1,15 +1,20 @@
-# User config — contains no credentials but keep out of version control
+# User data — never commit (settings, backups, portraits, logs)
 dnd_healthbar_public.json
+dnd_healthbar_public.json.*
+dnd_healthbar_public.damaged-*.json
 dnd_healthbar.json
+dnd_healthbar.log*
+portraits/
 
 # PyInstaller build output
 dist/
 build/
 *.spec.bak
 
-# Python cache
+# Python cache / tests
 __pycache__/
 *.py[cod]
+.pytest_cache/
 
 # Backup files
 *.bak
